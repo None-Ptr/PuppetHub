@@ -285,8 +285,9 @@ def overlay_scrim(page, title: str, body, actions=None, width: int = 760) -> Non
             width=width, padding=12, bgcolor=BG,
             border=ft.Border.all(1, RULE),
             content=ft.Column(expand=True, spacing=8, controls=[
+                # 标题是**文案**：走标记解析，否则 `` `new` `` 这种反引号会字面上屏
                 mono(title, size=SIZE_BODY, color=AMBER,
-                     weight=ft.FontWeight.BOLD, selectable=False),
+                     weight=ft.FontWeight.BOLD, selectable=False, md=True),
                 rule(),
                 ft.Container(content=body, expand=True),
                 ft.Row(spacing=8, wrap=True, run_spacing=6, controls=list(actions)),

@@ -49,6 +49,7 @@ class HomeWindow:
         self._probing = False
         self._typing = False
         self._stream = ""
+        self._live = None            # 流式那一行（一个**控件引用**，不是靠 value 找）
         self._closing = False
         # 控件
         self.list_view = ft.Column(spacing=0, scroll=ft.ScrollMode.AUTO)
@@ -171,10 +172,11 @@ class HomeWindow:
             content=body)
 
     def _unavailable_text(self) -> str:
-        error = (getattr(self.orchestrator, "provider_error", "")
-                 or getattr(self, "provider_error", ""))
-        if not error:
-            error = "没有可用的 llm_provider"
+        if self.orchestrator is None:
+            return ("本次以 `--no-llm` 启动：**没有调度官**（社会台照常）。\n"
+                    "要有调度官就别加这个开关，先配模型：`puppethub keys set <KEY_ENV>`")
+        error = getattr(self.orchestrator, "provider_error", "") \
+            or "没有可用的 llm_provider"
         return "调度官不可用：\n%s" % error
 
     # ------------------------------------------------------------ 键盘
@@ -248,11 +250,12 @@ class HomeWindow:
                 content=ft.Row(spacing=8, controls=[
                     theme.mono("▌ %s" % item["name"], size=theme.SIZE_BODY,
                                color=theme.BG, weight=ft.FontWeight.BOLD,
-                               selectable=False),
+                               selectable=False, no_wrap=True),
                     theme.mono(item["root"], size=theme.SIZE_MICRO, color=theme.BG,
-                               selectable=False, expand=True),
+                               selectable=False, expand=True, no_wrap=True,
+                               overflow=ft.TextOverflow.ELLIPSIS),
                     theme.mono(state, size=theme.SIZE_MICRO, color=theme.BG,
-                               selectable=False)]),
+                               selectable=False, no_wrap=True)]),
                 on_click=lambda _e, p=position: self._click(p))
         return ft.Container(
             padding=ft.Padding(6, 3, 6, 3),
@@ -260,11 +263,12 @@ class HomeWindow:
                 theme.mono("%s %s" % (item["mark"] or "", item["name"]),
                            size=theme.SIZE_BODY,
                            color=theme.DIM if item["mark"] else theme.TEXT,
-                           selectable=False),
+                           selectable=False, no_wrap=True),
                 theme.mono(item["root"], size=theme.SIZE_MICRO, color=theme.DIM,
-                           selectable=False, expand=True),
+                           selectable=False, expand=True, no_wrap=True,
+                           overflow=ft.TextOverflow.ELLIPSIS),
                 theme.mono(state, size=theme.SIZE_MICRO, color=theme.DIM,
-                           selectable=False)]),
+                           selectable=False, no_wrap=True)]),
             on_click=lambda _e, p=position: self._click(p))
 
     def _state_text(self, item: dict) -> str:
@@ -373,7 +377,9 @@ class HomeWindow:
             self._note_transcript(level, text)
         elif kind == "delta":
             self._stream += payload
-            self.transcript.controls[-1].value = "   " + self._stream[-400:]
+            if self._live is not None:
+                # 走 set_md：流里的 `**` 是**标记**，不能字面上屏
+                theme.set_md(self._live, "   " + self._stream[-400:], theme.SIZE_DATA)
         elif kind == "turn":
             self._finish_turn(payload)
         elif kind == "after":
@@ -384,19 +390,31 @@ class HomeWindow:
     # ------------------------------------------------------------ 转录
 
     def _note_transcript(self, level: str, text: str) -> None:
-        color = {"error": theme.RED, "warning": theme.AMBER}.get(level, theme.DIM)
-        stamp = time.strftime("%H:%M:%S")
+        """转录一行：`时间 │ 文本`。
+
+        文本走 `theme.spans`——**文案里的 `**` 是标记**：直接 `mono()` 会把字面星号
+        打上屏（这一条踩过，用户截图发现的）。
+        """
+        color = {"error": theme.RED, "warning": theme.AMBER,
+                 "user": theme.TEXT}.get(level, theme.DIM)
+        stamp = ft.TextSpan("%s │ " % time.strftime("%H:%M:%S"),
+                            style=ft.TextStyle(
+                                font_family=theme.MONO, size=theme.SIZE_DATA,
+                                color=theme.DIM,
+                                font_family_fallback=list(theme.MONO_FALLBACK)))
         self.transcript.controls.append(
-            theme.mono("%s │ %s" % (stamp, text), size=theme.SIZE_DATA,
-                       color=color, selectable=False))
+            ft.Text(spans=[stamp] + theme.spans(text, theme.SIZE_DATA),
+                    size=theme.SIZE_DATA, color=color, font_family=theme.MONO,
+                    font_family_fallback=list(theme.MONO_FALLBACK),
+                    selectable=False))
 
     def _finish_turn(self, result: TurnResult) -> None:
-        if self.transcript.controls:
-            self.transcript.controls[-1].value = ("   " + self._stream[-400:]) \
-                if self._stream else ""
+        if self._live is not None:
+            # 流式那一行是**草稿**：收尾时按结果重排，所以把草稿摘掉
+            self.transcript.controls = [c for c in self.transcript.controls
+                                        if c is not self._live]
+            self._live = None
         self._stream = ""
-        self.transcript.controls = [c for c in self.transcript.controls
-                                    if (c.value or "") != ""]
         if result.error:
             self._note_transcript("error", text=result.error)
         if result.explanation:
@@ -495,8 +513,9 @@ class HomeWindow:
         self.composer.value = ""
         self._note_transcript("user", "‹ " + text)
         self._stream = ""
-        self.transcript.controls.append(theme.mono("   ", size=theme.SIZE_DATA,
-                                                   color=theme.DIM, selectable=False))
+        self._live = theme.mono("   ", size=theme.SIZE_DATA, color=theme.DIM,
+                                selectable=False)
+        self.transcript.controls.append(self._live)
         self.page.update()
         orchestrator = self.orchestrator
 

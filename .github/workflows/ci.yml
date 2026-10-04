@@ -8,8 +8,8 @@
 # 3. 钉 ubuntu-24.04（mpv/alsa 的包名在 22.04 与 24.04 不同，防 runner 漂移炸包名）。
 #
 # CI 跑四件事，都以退出码说话：
-# 1. `verify-ci` —— 产品渲染器跑全量 conformance（PyPI 2.1 = 117 用例；
-#    2.1.1 上线含 i-input-submit-payload 后为 118，届时把版本钉切到 2.1.1）。
+# 1. `verify-ci` —— 产品渲染器跑全量 conformance（PyPI 2.1.1 = 118 用例，
+#    含 i-input-submit-payload；2.1 及更早为 117）。
 # 2. 机制冒烟 —— docs/ 的 smoke-*.py 经 .gitignore 白名单进版本库：全机制型
 #    （假 provider、FLET_APP_HIDDEN），CI 可跑。
 # 3. 渲染层字段面探针。
@@ -40,7 +40,7 @@ jobs:
             libmpv2 libasound2t64 libsecret-1-0 libblkid1 liblzma5
 
       - name: 安装语言标准实现（版本真源 = PyPI）
-        run: pip install "openpuppet-language==2.1"
+        run: pip install "openpuppet-language==2.1.1"
 
       - name: 安装 puppethub
         run: pip install -e .

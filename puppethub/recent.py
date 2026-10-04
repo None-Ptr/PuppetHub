@@ -5,7 +5,7 @@
 
 ```toml
 [projects]
-"E:/Projects/PuppetHub/demo" = "2026-10-04T12:00:00"
+"/path/to/demo" = "2026-10-04T12:00:00"
 ```
 
 两条纪律：

@@ -7,6 +7,8 @@ build/
 /dist/
 .venv/
 venv/
+# 发布验证用的临时 venv（用完可删；因占用/守卫未清掉，先确保不被提交）
+.release-check/
 .pytest_cache/
 .mypy_cache/
 .coverage
@@ -29,6 +31,6 @@ build-work/
 docs/*
 !docs/smoke-*.py
 !docs/probe-flet-fields.py
-!docs/shot-ui.py
+!docs/shot-*.py
 !docs/fixtures/
 !docs/fixtures/**
