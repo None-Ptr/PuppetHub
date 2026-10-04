@@ -294,6 +294,9 @@ class FletRenderer:
         # 由它自己的事件绑定翻译成引擎事件——而不是绕过界面直接 shot 进引擎。
         self._controls: dict[str, list] = {}
         self._event_diags: list = []
+        self._overlay_owned: list = []      # 本渲染器上一帧放进 page.overlay 的覆盖层
+        self._window_applied: dict = {}     # 我们上次写进真实窗口的尺寸/位置
+        self.applied_window = (None, None)  # app 声明的 (w, h)——宿主的判据
 
     # ------------------------------------------------------------ 入口
 
@@ -343,10 +346,24 @@ class FletRenderer:
         self.host.spacing = self._gap(node.id, snap, None, 8)
 
     def _size_window(self, node, snap) -> None:
+        """把 app 声明的窗口尺寸/位置应用到真实窗口——**只在声明变化时写**。
+
+        每帧重写会变成一把扳手：用户拖不动窗口（我们立刻扳回去），宿主也没法在
+        舞台之外加控制台（宽度会被重置）。所以：① 只在**我们自己上次写过的值**
+        变化时才写（拿实时窗口值比对不行——宿主会把控制台宽度加回来，那就永远
+        "不相等"）；② 把声明尺寸报给宿主（`applied_window`），由宿主决定外框。
+        """
+        declared = []
         for attr, field in (("w", "width"), ("h", "height"), ("x", "left"), ("y", "top")):
             value = self._val(node.id, attr, snap, None)
-            if value is not _MISSING:
+            if value is _MISSING:
+                declared.append(None)
+                continue
+            declared.append(int(value))
+            if self._window_applied.get(field) != int(value):
+                self._window_applied[field] = int(value)
                 setattr(self.page.window, field, int(value))
+        self.applied_window = (declared[0], declared[1])
 
     def _apply_dialogs(self, snap: dict) -> None:
         """`dialog` 是覆盖层：层叠（后声明在上）、可见时阻断下层交互。
@@ -381,7 +398,15 @@ class FletRenderer:
             if title is not _MISSING:
                 dialog.title = ft.Text(str(title))
             overlays.append(dialog)
-        self.page.overlay[:] = overlays
+        # `page.overlay` 是**共享**的：驾驶舱的"记忆 / 本轮 prompt"浮层、关窗前的
+        # 脏状态拦截框都挂在这里。整表覆盖会把它们一起抹掉（打开的记忆浮层会在
+        # 下一次重绘时凭空消失；关窗拦截框会连人都看不到）。所以只替换**本渲染器
+        # 上一帧放进去的那些**，其余原样保留。
+        owned = {id(item) for item in self._overlay_owned}
+        kept = [item for item in self.page.overlay if id(item) not in owned]
+        kept.extend(overlays)
+        self.page.overlay[:] = kept
+        self._overlay_owned = overlays
 
     # ------------------------------------------------------------ 值 / 标志
 
@@ -650,7 +675,14 @@ class FletRenderer:
             return self._undeliverable(
                 node_id, "该节点在模板内且有多行实例，程序化投递缺少行上下文")
         _row_index, control = entries[0]
-        handler = getattr(control, _EVENT_HANDLER.get(action, "on_click"), None)
+        field = _EVENT_HANDLER.get(action)
+        if field is None:
+            # 不认识的动作**不能**默默当成 click：那会把"我想触发 change"变成
+            # "我点了它一下"，而调用方以为动作送达了。宁可如实说投递不了。
+            return self._undeliverable(
+                node_id, "不认识的用户动作 %r（可用：%s）"
+                         % (action, "、".join(sorted(_EVENT_HANDLER))))
+        handler = getattr(control, field, None)
         if not callable(handler):
             return self._undeliverable(node_id, "部件没有绑定 %s" % action)
         if value is not None and hasattr(control, "value"):

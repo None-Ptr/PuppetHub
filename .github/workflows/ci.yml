@@ -1,16 +1,19 @@
 # V3：自动化 / CI 接入。
 #
-# CI 跑三件事，都以退出码说话：
-# 1. `verify-ci` —— 产品渲染器跑全量 conformance（118 用例，经 puppethub.protocol）；
-#    语言包按版本真源从 PyPI 安装（openpuppet-language==2.1）。
-# 2. 机制冒烟 —— docs/ 的 smoke-*.py 已通过 .gitignore 白名单进版本库（设计文档
-#    仍不进，是既定决议）：协议外壳 / 控制面 / 记忆 / V2 边界 / hub / 融合 / edit /
-#    build / society 全部机制型（假 provider、FLET_APP_HIDDEN），CI 可跑。
-# 3. `compileall` —— 字节码编译过一遍，低级语法错误进不了主干。
+# 首跑教训（run 37184403496）：0/117 全挂 + 跳过 9——不是用例问题，是 flet 桌面
+# client 在 ubuntu 上起不来（缺系统库），被测实现的窗口进程握手不上，所有依赖
+# 会话的用例一起挂。修复三件套：
+# 1. 按 flet client 的 Linux 依赖面**补齐系统库**（GTK3 / cairo / pango / mpv 等）；
+# 2. 在自证之前加**动态库自检** step：ldd 直接点名缺哪个 .so——缺库可见，不猜；
+# 3. 钉 ubuntu-24.04（mpv/alsa 的包名在 22.04 与 24.04 不同，防 runner 漂移炸包名）。
 #
-# flet 的"headless 不是免费项"（设计 spike 2 结论）：无显示器环境需要 X，
-# 统一用 xvfb-run 包住 verify-ci 与开窗口的冒烟。首次真实触发若还缺系统库，
-# CI 会以可见失败列出——补装即可，不假装绿。
+# CI 跑四件事，都以退出码说话：
+# 1. `verify-ci` —— 产品渲染器跑全量 conformance（PyPI 2.1 = 117 用例；
+#    2.1.1 上线含 i-input-submit-payload 后为 118，届时把版本钉切到 2.1.1）。
+# 2. 机制冒烟 —— docs/ 的 smoke-*.py 经 .gitignore 白名单进版本库：全机制型
+#    （假 provider、FLET_APP_HIDDEN），CI 可跑。
+# 3. 渲染层字段面探针。
+# 4. `compileall`。
 name: CI
 
 on:
@@ -20,7 +23,7 @@ on:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -28,8 +31,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 安装 flet 无头运行所需的系统库（X 虚拟显示等）
-        run: sudo apt-get update && sudo apt-get install -y xvfb libglib2.0-0 libgl1
+      - name: 安装 flet 桌面 client 的 Linux 系统依赖（X 虚拟显示 + GTK/GL 栈）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb libglib2.0-0t64 libgl1 libegl1 libgles2 \
+            libgtk-3-0t64 libcairo2 libpango-1.0-0 libgdk-pixbuf-2.0-0 \
+            libmpv2 libasound2t64 libsecret-1-0 libblkid1 liblzma5
 
       - name: 安装语言标准实现（版本真源 = PyPI）
         run: pip install "openpuppet-language==2.1"
@@ -37,7 +45,25 @@ jobs:
       - name: 安装 puppethub
         run: pip install -e .
 
-      - name: 自证（产品渲染器 × 全量 conformance）
+      - name: flet 桌面 client 动态库自检（缺库当场点名，不进自证猜谜）
+        run: |
+          CLIENT_DIR=$(python -c "import flet_desktop, os; print(os.path.dirname(flet_desktop.__file__))")
+          echo "client dir: $CLIENT_DIR"
+          BIN=$(find "$CLIENT_DIR" -type f ! -name '*.so*' ! -name '*.py*' ! -name '*.json' ! -name '*.txt' | head -5)
+          echo "candidates: $BIN"
+          FOUND=0
+          for b in $BIN; do
+            MISSING=$(ldd "$b" 2>/dev/null | grep "not found" || true)
+            if [ -n "$MISSING" ]; then
+              echo "缺库（$b）:"
+              echo "$MISSING"
+              FOUND=1
+            fi
+          done
+          if [ "$FOUND" = "1" ]; then exit 1; fi
+          echo "动态库齐全"
+
+      - name: 自证（产品渲染器 × 全量 conformance，xvfb 无头）
         run: xvfb-run -a python -m puppethub verify-ci
 
       - name: 机制冒烟（协议 / 控制面 / 记忆 / V2 / hub / 融合 / edit / build / society / 窗口 / LLM 回路）

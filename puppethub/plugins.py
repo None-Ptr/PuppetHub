@@ -70,8 +70,19 @@ class PluginAPI:
         return self.config.get(key, default)
 
     def secret(self, env_name: str) -> Optional[str]:
-        """凭据走**环境变量**，toml 只存变量名——toml 会被 git 跟踪、进 dist、被融合拷贝。"""
-        return os.environ.get(env_name) if env_name else None
+        """凭据解析：**进程环境变量 → 本机钥匙串**（顺序写死在 `secrets.resolve`）。
+
+        toml 只存变量名——它会进 git、进 dist、被融合拷贝；钥匙串在 `~/.puppethub/`，
+        **在 app 目录之外**，所以分享/打包 app 不会带上它。
+        """
+        from . import secrets
+        value, _source = secrets.resolve(env_name)
+        return value
+
+    def secret_info(self, env_name: str) -> dict:
+        """来源层次 + 长度（**不回显任何字符**）——错误信息里说清用的是哪一层。"""
+        from . import secrets
+        return secrets.secret_info(env_name)
 
     def log(self, level: str, message: str) -> None:
         if self._log is not None:

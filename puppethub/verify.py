@@ -91,27 +91,3 @@ def _spawn_runner(runner: str, directory: str, filter_text: str,
         if on_line is not None and any(token in line for token in _INTERESTING):
             on_line(line)
     return proc.wait(), lines
-
-    command = [sys.executable, runner, "--impl-module", "puppethub.protocol"]
-    if filter_text:
-        command += ["--filter", filter_text]
-    if on_line is not None:
-        on_line("自证开始：%s" % " ".join(command[1:]))
-    proc = subprocess.Popen(command, cwd=os.path.dirname(directory), env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, encoding="utf-8", errors="replace")
-    lines: list[str] = []
-    for raw in proc.stdout:
-        line = raw.rstrip()
-        lines.append(line)
-        if on_line is not None and any(token in line for token in _INTERESTING):
-            on_line(line)
-    code = proc.wait()
-
-    summary = next((line.strip() for line in reversed(lines) if "通过" in line), "")
-    failed = [line.strip() for line in lines if line.strip().startswith("FAIL")]
-    ok = code == 0 and not failed
-    if on_line is not None:
-        on_line("自证结束：%s（退出码 %d）" % (summary or "没有汇总行", code))
-    return {"ok": ok, "returncode": code, "summary": summary,
-            "failed": failed[:20], "lines": lines[-60:], "total": len(lines)}

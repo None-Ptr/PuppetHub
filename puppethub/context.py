@@ -239,14 +239,13 @@ def _fit(context: dict, budget: int) -> None:
                 context["omitted"].append("DESIGN.md")
                 context["design"] = ""
         elif layer == "turns":
-            keep = []
-            for turn in context.get("turns") or []:
-                keep.append(turn)
-                if len(keep) >= max(1, len(context["turns"]) // 2):
-                    break
-            if len(keep) < len(context["turns"]):
-                context["omitted"].append("较早的 %d 轮对话"
-                                          % (len(context["turns"]) - len(keep)))
+            # 砍掉**较早**的一半，保留最近的一半：要省的是"很久以前说过什么"，
+            # 最近几轮恰恰是理解本轮请求最需要的。反过来保留最旧的等于
+            # 把上下文里最该留下的部分丢掉（且与下面那句 omitted 的措辞自相矛盾）。
+            turns = context.get("turns") or []
+            keep = turns[-max(1, len(turns) // 2):] if turns else []
+            if len(keep) < len(turns):
+                context["omitted"].append("较早的 %d 轮对话" % (len(turns) - len(keep)))
                 context["turns"] = keep
     if size(context)["total"] > budget:
         context["omitted"].append(

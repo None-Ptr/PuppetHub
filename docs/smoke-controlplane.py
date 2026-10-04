@@ -31,6 +31,12 @@ REQUIRES: list[str] = []
 def ping() -> dict:
     """冒烟用：回一个 pong。"""
     return {"pong": True}
+
+
+@capability(returns="str")
+def echo(text: str) -> str:
+    """冒烟用：原样返回（不列入借出清单 → 服务面必须拒绝）。"""
+    return text
 '''
 
 BATCH = [
@@ -77,6 +83,9 @@ def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="puppethub-cp-"))
     app = create_app(work / "app", "cp-smoke", "控制面冒烟")
     app.capabilities_path.write_text(CAPABILITIES, encoding="utf-8")
+    # 借出清单：只借 ping（echo 不在列 → 服务面必须默认拒绝）
+    with open(app.config_path, "a", encoding="utf-8") as fh:
+        fh.write('\n[service]\nlend = ["ping"]\n')
 
     failures = []
 
@@ -94,7 +103,7 @@ def main() -> int:
               % (hello.get("protocol"), len(hello.get("rendering", {}).get("controls") or []),
                  names or "（空）"))
         check("hello 带渲染自述", bool(hello.get("rendering", {}).get("controls")))
-        check("能力目录从 capabilities.py 派生", names == ["ping"], str(names))
+        check("能力目录从 capabilities.py 派生", names == ["echo", "ping"], str(names))
 
         source_before = "\n".join(app.read_source())
         resp = request(proc, {"op": "send", "batch": BATCH})
@@ -130,6 +139,19 @@ def main() -> int:
         resp = request(proc, {"op": "load", "program": ["add #root window #win"]})
         check("整份替换被拒绝且说明理由",
               "error" in resp and "命令批" in resp.get("error", ""), str(resp)[:200])
+
+        print("\n服务面（V4 B）：stdio 外壳与 TCP 外壳一致")
+        resp = request(proc, {"op": "call", "name": "ping", "args": {}})
+        check("借出能力可同步调用", resp.get("ok") is True
+              and resp.get("value") == {"pong": True}, str(resp))
+        resp = request(proc, {"op": "call", "name": "echo", "args": {"text": "嗨"}})
+        check("未列入借出清单一律拒绝（默认拒绝）",
+              resp.get("ok") is False and "未借出" in (resp.get("error") or ""),
+              str(resp))
+        resp = request(proc, {"op": "deliver_peer_event", "from_app": "x",
+                              "topic": "t", "text": "y"})
+        check("stdio 不是总线端点：如实拒绝并说明（不装作收到）",
+              "error" in resp and "远程实例" in resp.get("error", ""), str(resp))
 
         resp = request(proc, {"op": "quit"})
         check("quit 收尾", resp.get("ok") is True, str(resp))

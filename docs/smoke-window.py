@@ -68,6 +68,20 @@ def make_app() -> tuple[AppDir, Path]:
 def main() -> int:
     app, _work = make_app() if len(sys.argv) <= 1 else (AppDir(sys.argv[1]), None)
     session = Session(app)
+
+    # **start() 必须幂等**：cmd_run 先 start（打印装载诊断），窗口打开（_main）
+    # 又 start——第二次得是无操作，否则观察流里"已装载"出现两遍（实测踩过）。
+    session.start()
+    notes = lambda: len([e for e in session.log if e["code"] == "SESSION"])
+    before = notes()
+    again = session.start()
+    verdict = "ok" if not again and notes() == before else "失败"
+    print("[%s] start() 二次调用 = 无操作（diags=%d，SESSION 笔记 %d -> %d）"
+          % (verdict, len(again), before, notes()))
+    if verdict != "ok":
+        print("  ← 装载被执行了两遍", file=sys.stderr)
+        return 1
+
     hub = HubWindow(session)
 
     async def gui(page: ft.Page):
@@ -107,6 +121,13 @@ def main() -> int:
             print("接管后：stuck_note=%r · 接管栏=%s · LLM_RESUME=%s"
                   % (session.chat.stuck_note, hub.cockpit.takeover_row.visible,
                      any(e["code"] == "LLM_RESUME" for e in session.log)))
+
+            # 协作面可见（V4）：目标 / 总线 / 借出都在驾驶舱里有行——运行期状态
+            # 不能只藏在文件里（"凭什么方向跑、对外借了什么"人要看得见）。
+            session.set_goal("让完成率卡片反映当天数据。", origin="user")
+            hub.repaint()
+            print("协作行 = %s" % hub.cockpit.collab_text.value)
+            session.set_goal("", origin="user")
 
         errors = [e for e in session.log if e["level"] == "错误"]
         print("错误数 = %d" % len(errors))

@@ -21,6 +21,7 @@ from typing import Callable, Optional
 from puppet import SPEC_VERSION, Engine
 
 from . import catalog as _catalog
+from . import secrets
 from .appdir import AppDir, ConfigError, HUB_DIR, Snapshot
 from .chat import Chat
 from .compat import check_data_files, check_spec_version
@@ -96,6 +97,7 @@ class Session:
         self.fusion_target: str | None = None       # 融合对象路径（grilling 共识：只存路径，其余现算）
         self._cap_stamp = 0.0                       # capabilities.py 的 mtime（热重载检查点）
         self.plugin_error = ""
+        self._started = False                       # start() 的幂等闸（见 start 的注释）
         # V4 服务化与协作：`lend` 是**借出**的能力白名单（缺省空 = 默认拒绝）；
         # `bus` 是协作总线客户端（hub 没起就 None，tell 可见失败）。
         # lend 在 _build_plugins 里随 config 装载（配置在那里才读得到）。
@@ -105,7 +107,16 @@ class Session:
     # ------------------------------------------------------------ 生命周期
 
     def start(self) -> list:
-        """装载插件、真源与能力模块。返回装载期诊断。"""
+        """装载插件、真源与能力模块。返回装载期诊断。**幂等**。
+
+        两个入口都会调它：`cmd_run` 先 start（要打印装载诊断），窗口打开
+        （`HubWindow._main`）再 start（保证任何入口进来的会话都已就绪）——
+        第二次必须是无操作，否则观察流里"已装载"出现两遍（实测）。
+        显式重载请走 `reload()`，别重复 start。
+        """
+        if self._started:
+            return []
+        self._started = True
         self._build_plugins()
         modules = [str(self.app.capabilities_path)] if self.app.capabilities_path.is_file() else []
         if not modules:
@@ -151,6 +162,7 @@ class Session:
             self._note("CONFIG", "错误", str(ex))
             self.plugin_error = str(ex)
             self.config = {}
+        self._apply_llm_profile()
         self.registry = build_registry(include_user=False)
         # 插件目录两处：app 自带（.puppethub/plugins/，随 app 走）+ 用户全局。
         # app 级目录让"这个 app 需要的插件"和 app 一起搬——融合/拷贝时不会掉件。
@@ -438,6 +450,57 @@ class Session:
     def _rebuild_catalog(self) -> None:
         self._catalog = _catalog.compact(self.engine.capabilities.values())
 
+    # ------------------------------------------------------------ 凭据（V5）
+
+    def _apply_llm_profile(self) -> None:
+        """`[llm] profile = "名字"` → 把机器级 `providers.toml` 的端点/模型/凭据名
+        **补进** `[plugins.openai-compat]`（app 里的显式键优先）。
+
+        为什么在宿主做而不在插件里做：机器级文件的位置与解析是宿主的职责，
+        插件只该看见"自己的配置"（铁律：插件不拿引擎句柄、只产出值）。这样
+        端点与凭据名留在机器上，**app 因此可以安全分享**。
+        """
+        block = self.config.get("llm")
+        if not isinstance(block, dict) or not block.get("profile"):
+            return
+        name = str(block["profile"])
+        table = secrets.profile(name)
+        if not table:
+            self.note("error", "LLM_PROFILE", secrets.profile_error(name))
+            return
+        plugins = self.config.setdefault("plugins", {})
+        options = plugins.setdefault("openai-compat", {})
+        if not isinstance(options, dict):
+            return
+        added = []
+        for key in ("base_url", "model", "key_env", "temperature",
+                    "context_limit", "timeout"):
+            if key in table and key not in options:
+                options[key] = table[key]
+                added.append(key)
+        self.note("info", "LLM_PROFILE",
+                  "profile %s → %s（来自 %s；app 里的显式键优先）"
+                  % (name, "、".join(added) or "（无需补）", secrets.providers_path()))
+
+    def credential_names(self) -> list:
+        """本 app 需要的凭据变量名（当前 llm provider 的 `key_env`）。"""
+        options = (self.config.get("plugins") or {}).get("openai-compat") or {}
+        return [str(options.get("key_env") or "OPENAI_API_KEY")]
+
+    def llm_settings(self) -> dict:
+        """探活要用的三样（**不含密钥**——由 `keys.probe` 自己去解析）。"""
+        options = (self.config.get("plugins") or {}).get("openai-compat") or {}
+        return {"base_url": str(options.get("base_url")
+                                or "https://api.openai.com/v1"),
+                "model": str(options.get("model") or ""),
+                "key_env": str(options.get("key_env") or "OPENAI_API_KEY")}
+
+    def check_credentials(self) -> dict:
+        """探活 + 泄漏自检（驾驶舱与 CLI 共用同一实现）。"""
+        from . import keys as _keys
+        return _keys.check(self.app.root, names=self.credential_names(),
+                           settings=self.llm_settings())
+
     # ------------------------------------------------------------ 服务化与协作（V4）
 
     def service_manifest(self) -> dict:
@@ -494,21 +557,38 @@ class Session:
             return {"ok": False, "error": "能力 %s 没有可执行体" % name}
         timeout = float((getattr(self.engine, "limits", None) or {})
                         .get("callTimeoutMs", 5000)) / 1000.0
-        import concurrent.futures
         import inspect
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, fn(**args)) if inspect.iscoroutinefunction(fn) \
-                else pool.submit(fn, **args)
+        # **为什么不用 ThreadPoolExecutor**：① 它的上下文管理器退出时 `shutdown(wait=True)`
+        # 会等那个**已判定超时**的任务跑完，超时就只写在诊断里、调用方照样被卡死；
+        # ② 它的工作线程是**非守护**线程，挂死的能力会在解释器退出时被 atexit join，
+        # 把"关不掉"从这一步一路传染到进程结束。
+        # 所以自己起一条 **daemon** 线程 + Event 等待：超时能真脱身，挂死线程随进程一起消失。
+        box: dict = {}
+        done = threading.Event()
+
+        def _invoke() -> None:
             try:
-                value = future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                self._note("SLOT_TIMEOUT", "错误",
-                           "能力 %s 执行超时（%s）" % (name, timeout))
-                return {"ok": False, "error": "能力 %s 执行超时" % name}
-            except Exception as ex:  # noqa: BLE001 - 能力炸了要可见
-                self._note("CALL_RESULT", "错误",
-                           "能力 %s 调用失败：%s: %s" % (name, type(ex).__name__, ex))
-                return {"ok": False, "error": "%s: %s" % (type(ex).__name__, ex)}
+                box["value"] = (asyncio.run(fn(**args))
+                                if inspect.iscoroutinefunction(fn) else fn(**args))
+            except BaseException as ex:  # noqa: BLE001 - 能力炸了/挂了都要过线
+                box["error"] = ex
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_invoke, daemon=True,
+                                  name="capability-%s" % name)
+        worker.start()
+        if not done.wait(timeout):
+            self._note("SLOT_TIMEOUT", "错误",
+                       "能力 %s 执行超时（%s）——本步放弃等待，挂死的线程随进程退出"
+                       % (name, timeout))
+            return {"ok": False, "error": "能力 %s 执行超时" % name}
+        if "error" in box:
+            ex = box["error"]
+            self._note("CALL_RESULT", "错误",
+                       "能力 %s 调用失败：%s: %s" % (name, type(ex).__name__, ex))
+            return {"ok": False, "error": "%s: %s" % (type(ex).__name__, ex)}
+        value = box.get("value")
         try:
             json.dumps(value)
         except (TypeError, ValueError) as ex:
@@ -719,9 +799,14 @@ class Session:
         一个是人的指令，一个是系统自保；混在一起就分不清"我的记忆怎么没了"。
         """
         if self.memory is not None:
+            # Memory.wipe 自带一条 MEMORY_WIPED（含清掉的条数）；这里**不再重记**，
+            # 否则同一次清空在观察流里出现两条同样的码，反而看不清清了几条。
             self.memory.wipe(origin)
+        else:
+            # 记忆槽位没装配时也要留痕：整区照样被清掉了，不能毫无记录。
+            self.note("info", "MEMORY_WIPED",
+                      "运行期记忆整区已清空（origin=%s；记忆未装配，无法计数）" % origin)
         self.app.wipe_memory()          # 整区清掉：记忆是独立成区的，清就清干净
-        self.note("info", "MEMORY_WIPED", "运行期记忆整区已清空（origin=%s）" % origin)
 
     def memory_entries(self) -> list:
         return self.memory.entries() if self.memory is not None else []

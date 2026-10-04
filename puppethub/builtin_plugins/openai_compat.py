@@ -4,7 +4,9 @@
 这样实时性不会在插件层丢掉（OpenAI 兼容 API 原生流式，若接口要求"返回完整字符串"，
 插件就得内部攒完再给，用户界面上的逐字输出就没了）。
 
-凭据只从**环境变量**读（`key_env` 存的是变量名）——toml 会被 git 跟踪、进 dist、被融合拷贝。
+凭据解析：**进程环境变量 → 本机钥匙串**（`key_env` 存的是变量名；两层都在
+`secrets.resolve` 里，顺序写死）。toml 只存变量名——它会进 git、进 dist、
+被融合拷贝；钥匙串在 `~/.puppethub/`（app 目录之外）。
 """
 
 from __future__ import annotations
@@ -49,13 +51,19 @@ class OpenAICompatProvider:
     def stream(self, messages: List[dict]) -> Iterator[str]:
         if not self.model:
             raise PluginError(
-                "没有配置模型：在 app 的 puppethub.toml 里写 "
-                "[plugins.openai-compat] model = \"…\"")
+                "没有配置模型：二选一——\n"
+                "  ① 推荐：puppethub.toml 写 [llm] profile = \"名字\"，端点/模型/凭据名\n"
+                "     写在机器级 ~/.puppethub/providers.toml（app 里不留端点，可安全分享）；\n"
+                "  ② 或直接写 [plugins.openai-compat] model = \"…\"")
         key = self.api.secret(self.key_env)
         if not key:
+            from .. import secrets
             raise PluginError(
-                "环境变量 %s 里没有凭据。凭据只走环境变量（toml 只存变量名），"
-                "例如：set %s=sk-…" % (self.key_env, self.key_env))
+                "凭据 %s 没找到：进程环境变量与本机钥匙串（%s）两层都试过了。\n"
+                "  录入：puppethub keys set %s\n"
+                "  或改 puppethub.toml 的 [llm] profile / key_env；"
+                "设了环境变量要重启（env 优先级更高）"
+                % (self.key_env, secrets.secrets_path(), self.key_env))
 
         payload = {"model": self.model, "messages": messages, "stream": True}
         if self.temperature is not None:

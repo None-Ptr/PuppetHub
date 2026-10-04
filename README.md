@@ -134,6 +134,23 @@ def create_llm_provider(api):      # 每个槽位一个工厂
   桌面窗口需要显示服务器——不声明做不到的）。**PyInstaller 已实测**：构建成功、
   产物 `verify-ci` 118/118 全绿（含三颗雷的修复：可编辑安装的 pathex、flet 数据文件、
   冻结态自证链的 python 替身垫片——详见 spec 头注释）
+- **GUI 覆盖 CLI（"所有仅 CLI 功能都有图形入口"）**：驾驶舱「操作 » 凭据」是
+  **模型设置**（base_url / 模型 / 凭据名 / 凭据值 + 探活；端点可落"仅本 app"或
+  "本机 profile"，**凭据可落钥匙串或环境变量**——落点写在选择旁边，含代价说明与
+  "清掉环境变量那把"的撤销路径）；「工具」抽屉把 CLI 每条命令搬成浮层——
+  `new` 新建 app · `edit` **人的写入**（整份替换：干跑 → 兜底快照 → 拒稿留底）·
+  `repl` 命令批（origin=driver）· `build` 打包（生成工程 / 连跑 flet build）·
+  `hub` 编排（list/up/down/status/bus）· `remote` 服务化（真起无头进程）·
+  `fuse` 融合（先体检干跑再执行）。**每个动作都是可被冒烟直接调用的方法**
+  （`gui_tools.py`），浮层只是薄壳；语义一律在 service 层——CLI 与 GUI 同源，
+  靠 `smoke-gui.py` 第 8 节机制化断言
+- **凭据体系（V5）**：`docs/design-credentials.md`——**三层解析**（进程环境变量 →
+  本机钥匙串 `~/.puppethub/secrets.toml` 0600 → 报错说清试过哪两层）· **机器级 profile**
+  （`~/.puppethub/providers.toml` 存端点/模型/凭据名，app 里只写 `[llm] profile = "名字"`，
+  因此 **app 可以安全分享**）· **探活**把 401/403/404/429/超时/连不上分开说清 ·
+  **泄漏自检**真去 app 内文本文件里找明文（命中只报位置）· CLI `puppethub keys list|set|check`
+  与驾驶舱「操作 » 凭据」共用同一实现。铁律：只有 `secrets.resolve()` 取明文，
+  一切输出只给**名字/来源/长度**（连掩码都不给）
 - **Agent 社会（V4）**：`docs/design-v4-society.md`——app 即服务（服务清单挂在 hello、
   `call` 操作借出能力、**借出白名单缺省空 = 默认拒绝**）· 协作总线（`hub up` 自动拉起，
   消息 = 刺激不是写入，投递进对方观察流并触发其自主回路，审计落账 `hub bus`）·

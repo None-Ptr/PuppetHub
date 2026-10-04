@@ -36,10 +36,14 @@ class HubBus:
 
     def __init__(self, lookup_port: Callable[[str], Optional[int]],
                  audit_path: Optional[Path] = None,
-                 timeout: float = 2.5):
+                 timeout: float = 2.5,
+                 on_message: Optional[Callable[[dict], None]] = None):
         self._lookup_port = lookup_port
         self._audit_path = audit_path
         self._timeout = timeout
+        # 观察者：每投递一次（含回执）调一次。**社会层（首页）用它把消息变成
+        # 调度官的刺激源**；它不是订阅者，不改投递语义。
+        self._on_message = on_message
         self._subs: dict[str, set] = {}      # app -> topics
         self._lock = threading.Lock()
 
@@ -67,9 +71,15 @@ class HubBus:
             port = self._lookup_port(app)
             reply = self._deliver(app, port, entry)
             (delivered if reply.get("ok") else failed).append(app)
-        entry2 = dict(entry, delivered=delivered, failed=failed)
         self._audit({"time": entry["time"], "from": from_app,
                      "topic": topic, "delivery": {"ok": delivered, "failed": failed}})
+        if self._on_message is not None:
+            try:
+                self._on_message(dict(entry, delivered=list(delivered),
+                                      failed=list(failed)))
+            except Exception as ex:  # noqa: BLE001 - 观察者坏掉**可见**，但总线照常
+                self._audit({"time": entry["time"], "from": "bus", "topic": "observer",
+                             "error": "%s: %s" % (type(ex).__name__, ex)})
         return {"ok": True, "delivered": delivered, "failed": failed}
 
     def _deliver(self, app: str, port: Optional[int], entry: dict) -> dict:
@@ -169,9 +179,21 @@ def serve_bus(bus: HubBus, port: int, server: Optional[socket.socket] = None) ->
                              .encode("utf-8"))
 
     while True:
-        conn, addr = server.accept()
+        try:
+            conn, addr = server.accept()
+        except OSError:
+            if _fileno(server) == -1:
+                return                 # 监听套接字被我们自己关掉 = 正常下线
+            raise                      # 别的 OSError 不吞
         threading.Thread(target=client, args=(conn,), daemon=True,
                          name="bus-%s" % (addr,)).start()
+
+
+def _fileno(server) -> int:
+    try:
+        return server.fileno()
+    except (OSError, ValueError):
+        return -1
 
 
 # ------------------------------------------------------------------ app 端

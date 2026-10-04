@@ -354,7 +354,14 @@ class Chat:
                          "prompt 插件 %s 返回的不是 {system, messages}" % name)
                 self.last_chain.append((name, False))
                 continue
-            changed = produced != layers[-1]
+            # "改写了" = 这个插件改动了它**拿到的** system / messages。
+            # 不能拿 `produced` 与整个 `layers[-1]` 比：后者带全部上下文键
+            # （source/turns/catalog…），而插件只回 {system, messages} ——
+            # 两边不同构，比较结果恒为"改写了"，这句提示就永远在撒谎。
+            before = layers[-1]
+            changed = (produced.get("system", "") != before.get("system", "")
+                       or list(produced.get("messages") or [])
+                       != list(before.get("messages") or []))
             self.last_chain.append((name, changed))
             layers.append(dict(context, system=produced.get("system", ""),
                                messages=produced.get("messages", [])))
@@ -523,7 +530,16 @@ class Chat:
             self.log("error", "AUTONOMOUS_BUDGET", result.skipped[-1])
             return
         diags = self.session.send(lines, origin=self.origin)
-        result.applied.append("命令批 %d 行" % len(lines))
+        # 写者状态机在**写入路径**上核对：在途的那一轮（写者已被切走）会拿到
+        # WRITER_DENIED。那种情况下命令批**没有**被应用，不能报成"命令批 N 行"
+        # ——把被拒说成已应用，是"杜绝静默失败"要防的那种谎报。
+        codes = {getattr(d, "code", None) or (d.get("code", "") if isinstance(d, dict) else "")
+                 for d in (diags or [])}
+        if "WRITER_DENIED" in codes:
+            result.skipped.append("命令批 %d 行被拒（当前写者不是 %s）"
+                                  % (len(lines), self.origin))
+        else:
+            result.applied.append("命令批 %d 行" % len(lines))
         for diag in diags or []:
             result.diagnostics.append(diag.to_dict() if hasattr(diag, "to_dict") else diag)
         self._absorb(diags)

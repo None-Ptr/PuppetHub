@@ -25,9 +25,10 @@ build-work/
 .puppet/
 .puppethub/
 .puppethub-hub/
-# 设计文档不进版本库（既定决议）；机制冒烟 / 探针 / 夹具进（CI 与他人可跑）。
+# 设计文档不进版本库（既定决议）；机制冒烟 / 探针 / 夹具 / UI 迭代工具进（可跑可用）。
 docs/*
 !docs/smoke-*.py
 !docs/probe-flet-fields.py
+!docs/shot-ui.py
 !docs/fixtures/
 !docs/fixtures/**

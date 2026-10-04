@@ -46,6 +46,22 @@ SKELETON_GITIGNORE = """# 引擎状态 / 记忆 / 快照：都是本机运行产
 .puppet/
 """
 
+SKELETON_CONFIG = '''# PuppetHub 的 app 配置。**零配置也能跑**（全用内置默认）；下面两块按需选一。
+
+# 方式一（推荐）：用本机命名 profile——端点与凭据名留在
+# ~/.puppethub/providers.toml（机器级），app 里只留名字，
+# 所以这个文件可以安全分享/提交。
+# [llm]
+# profile = "deepseek"
+
+# 方式二：直接写本 app 的 provider 选项（端点会随 app 一起被分享）
+# [plugins.openai-compat]
+# base_url = "https://api.openai.com/v1"
+# model = "gpt-4o-mini"
+# key_env = "OPENAI_API_KEY"      # 只写变量名；值走环境变量或 `puppethub keys set`
+'''
+
+
 SKELETON_CAPABILITIES = '''"""{title} 的能力（工具）。
 
 能力（`@puppet.capability`）是 **app 提供给 LLM 使用的工具**：LLM 通过 `call` 调用它，
@@ -397,6 +413,7 @@ def create_app(parent: str | os.PathLike, name: str,
     app.write_source(skeleton_source(shown), origin="system")
     # 用 replace 而不是 format/`%`：样板里含 `{}` 与 `%`，不能被当成占位符。
     app.write_capabilities(SKELETON_CAPABILITIES.replace("{title}", shown))
+    AppDir._atomic_write(app.config_path, SKELETON_CONFIG)
     AppDir._atomic_write(app.design_path,
                          SKELETON_DESIGN.replace("{title}", shown)
                          .replace("{today}", _dt.date.today().isoformat()))

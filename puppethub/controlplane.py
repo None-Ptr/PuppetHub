@@ -94,6 +94,16 @@ class AppBinding:
                 return {"image": None, "format": "png",
                         "diagnostics": [degrade("snapshot", "本次截图未产出图像（重试后仍为空）")]}
             return {"image": base64.b64encode(image).decode("ascii"), "format": "png"}
+        if op == "call":
+            # 服务面（V4 B）在两条外壳上一致：stdio 驱动者也能调借出的能力。
+            # 借出白名单与超时校验都在 session 里（同一台机制，不因通道而变）。
+            return session.call_capability(request.get("name", ""),
+                                           request.get("args") or {},
+                                           origin="driver")
+        if op == "deliver_peer_event":
+            return {"error": "控制面（stdio）不是协作总线的投递端点：总线只投给"
+                             "hub 编排的远程实例（有可被反向连接的端口）。"
+                             "本实例的协作入口是 send/fire。"}
         if op == "load":
             return {"error": "控制面不提供整份替换：那是不可回滚的确认式系统动作，"
                              "而本协议没有\"人确认\"这个通道。请发命令批（send）。"}

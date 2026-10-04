@@ -1,4 +1,7 @@
-"""`puppethub` 命令：`new` / `run` / `remote` / `repl` / `verify-ci`（+ 全局 `--json`）。
+"""`puppethub` 命令：**裸跑 = 首页**；`new` / `run` / `remote` / `repl` / `verify-ci`。
+
+裸跑（不给子命令）打开**首页**——一个项目都没有时的那一屏，同时是社会层的宿主
+（`docs/design-home.md`）。它**无条件**打开：想要某个 app 就 `puppethub run <app>`。
 
 **防漂移约束**：CLI 与驾驶舱按钮必须调用同一份 service 层实现，CLI 只做参数解析
 与输出格式化——两套入口各写一遍语义，迟早漂移。
@@ -46,6 +49,46 @@ def _print_diags(diags, as_json: bool) -> None:
         print("  %s %s %s: %s" % (where, mark, diag.code, diag.message))
 
 
+def _log_line(level: str, code: str, message: str) -> None:
+    """CLI 形态的社会层 / 调度官日志（剥掉界面内联标记——这里没有渲染器）。"""
+    from .theme import plain
+    print("  [%s] %s %s" % (level, code, plain(message)), file=sys.stderr)
+
+
+def cmd_home(args) -> int:
+    """首页：**一个项目都没有时的那一屏**，同时是社会层的宿主。
+
+    它**永不写任何 app 的真源**：手里只有 `SocietyOps`（白名单）与一个调度官。
+    `--no-llm` = 没有调度官（社会台照常：键盘与按钮都在）。
+    """
+    from .home import HomeWindow
+    from .orchestrator import Orchestrator, build_provider, resolve_model
+    from .society import Society, SocietyOps
+
+    society = Society(log=_log_line)
+    model = resolve_model()
+    ops = SocietyOps(society, log=_log_line,
+                     config={"plugins": {"openai-compat": dict(model["options"])}})
+    orchestrator = None
+    if args.no_llm:
+        print("首页（无调度官）：社会台照常可用（键盘与按钮都在）", file=sys.stderr)
+    else:
+        provider, error = None, model["error"]
+        if not error:
+            provider, error = build_provider(model["options"], log=_log_line)
+        if model["note"]:
+            print("  · %s" % model["note"], file=sys.stderr)
+        if error:
+            # **降级必须可见**：没有调度官，但社会台照常。
+            print("调度官不可用（社会台照常）：\n%s" % error, file=sys.stderr)
+        orchestrator = Orchestrator(ops, log=_log_line, provider=provider,
+                                    provider_error=error or "")
+    print("首页：社会层宿主在本进程（总线在进程内；关首页 = 社会层下线）",
+          file=sys.stderr)
+    HomeWindow(society, ops, orchestrator).run()
+    return 0
+
+
 def cmd_new(args) -> int:
     parent = Path(args.dir)
     try:
@@ -87,6 +130,11 @@ def cmd_run(args) -> int:
         print(str(ex), file=sys.stderr)
         return 1
     diags = session.start()
+    if args.hub_port:
+        # 协作总线端口（首页/`hub` 编排时注入）：**窗口实例也能说话**。
+        # 它仍然**收不到投递**（窗口不监听端口）——这是已知不对称，
+        # 见 docs/design-home.md 的"已知不对称"。
+        session.attach_hub(args.hub_port)
     if args.wipe_memory:
         # 清空运行期记忆**必须显式**：这是唯一会抹掉"经历"的动作，重置状态不碰它。
         session.wipe_memory(origin="user")
@@ -102,7 +150,7 @@ def cmd_run(args) -> int:
         _print_diags(diags, False)
         print("窗口已打开。关窗 = app 结束；再次 run 会从 .puppet/ 恢复状态。")
     from .window import HubWindow
-    HubWindow(session).run()
+    HubWindow(session, listen_port=args.listen_port).run()
     return 0
 
 
@@ -168,6 +216,72 @@ def cmd_repl(args) -> int:
         pending_lines.append(line)
     session.retry_storage()
     return 0
+
+
+def cmd_keys(args) -> int:
+    """凭据：清单 / 录入 / 探活与泄漏自检（V5）。
+
+    与驾驶舱里的 `密钥` / `探活` 共用同一份实现（`keys.py`）——两处各写一遍
+    语义，迟早漂移。
+    """
+    from . import keys as _keys
+
+    def open_session():
+        if not args.app:
+            return None
+        app = AppDir(args.app)
+        if not app.exists():
+            print("不是 app 目录（缺少 app.puppet）：%s" % app.root, file=sys.stderr)
+            return None
+        session = Session(app)
+        session.start()
+        return session
+
+    if args.action == "set":
+        if not args.name:
+            print("用法：puppethub keys set <变量名> [--env]", file=sys.stderr)
+            return 1
+        import getpass
+        value = getpass.getpass("粘贴 %s 的值（不回显）：" % args.name).strip()
+        if not value:
+            print("值为空，未写入。", file=sys.stderr)
+            return 1
+        outcome = _keys.set_secret(args.name, value,
+                                   target="env" if args.env else "keystore")
+        if not outcome.get("ok"):
+            print(outcome.get("error") or "写入失败", file=sys.stderr)
+            return 1
+        print(outcome["note"])
+        return 0
+
+    if args.action == "clear":
+        if not args.name:
+            print("用法：puppethub keys clear <变量名> [--keystore]", file=sys.stderr)
+            return 1
+        outcome = _keys.clear_secret(args.name,
+                                     target="keystore" if args.keystore else "env")
+        print(outcome["note"])
+        return 0
+
+    if args.action == "list":
+        session = open_session()
+        names = session.credential_names() if session else None
+        for line in _keys.list_lines(names):
+            print("  " + line)
+        if session:
+            print("  （本 app 需要：%s）" % "、".join(names))
+        print("  钥匙串：%s（在 app 目录之外，分享 app 不会带上它）"
+              % _keys.secrets.secrets_path())
+        return 0
+
+    session = open_session()
+    if session is None:
+        print("check 需要 --app（要读它的 provider 配置才知道探谁）", file=sys.stderr)
+        return 1
+    result = session.check_credentials()
+    # 终端没有渲染器：文案里的内联标记（`**重点**`）要剥掉，否则就是一堆星号。
+    print(_keys.plain(result["text"]))
+    return 0 if result["ok"] else 1
 
 
 def cmd_verify_ci(args) -> int:
@@ -259,12 +373,14 @@ def cmd_edit(args) -> int:
     """正式手写程序模式（V3）：人作驱动者，**编辑器即输入法**。
 
     打开 `$EDITOR`（缺省 notepad）编辑 `app.puppet`，保存退出后：
-    内容有变 → 确认 → 兜底快照 → 整份替换（load_source，与推倒重来同一纪律）
-    → 重载。**绕过对话，不绕过纪律**：单写者仍成立（写者=人这个驱动者），
-    每一步可见、可回滚。
+    内容有变 → 确认 → 兜底快照 → 整份替换 → 重载。**绕过对话，不绕过纪律**。
+
+    干跑校验 / 拒稿留底 / 兜底快照 / 决策流水全在 `humanedit.py` 里——驾驶舱的
+    「人的写入」走**同一份实现**（两处各写一遍语义，迟早漂移）。
     """
     import os
     import subprocess
+    from .humanedit import apply_text
     app = AppDir(args.app)
     if not app.exists():
         print("不是 app 目录（缺少 app.puppet）：%s" % app.root, file=sys.stderr)
@@ -275,38 +391,26 @@ def cmd_edit(args) -> int:
         print(str(ex), file=sys.stderr)
         return 1
     session.start()
-    before_lines = app.read_source()
-    before = "\n".join(before_lines)
+    before = "\n".join(app.read_source())
     editor = os.environ.get("EDITOR") or "notepad"
     subprocess.run([editor, str(app.source_path)], check=False)
-    after_lines = app.read_source()
-    after = "\n".join(after_lines)
+    after = "\n".join(app.read_source())
     if after == before:
         print("内容未变化：什么都不做。")
         return 0
     if args.yes or input("内容已变化，确认整份替换并重载？[y/N] ").strip().lower() in ("y", "yes"):
-        # **确认前先干跑**（与融合同一判据）：编辑器里写出的东西必须先证明是合法
-        # 程序，否则人会把程序改坏还以为成功了——"确认"确认的必须是能跑的东西。
-        from .fusion import _dry_run
-        errors = _dry_run(after_lines)
-        if errors:
-            # 编辑器动的是真源文件本身：拒绝采用时必须**恢复原样**，并把拒稿留在
-            # 旁边的文件里——人的工作不能丢，真源也不能坏。两头都要说清楚。
-            rejected = app.source_path.with_suffix(".puppet.rejected")
-            rejected.write_text(after + "\n", encoding="utf-8")
-            app.write_source(before_lines, origin="system")
+        # **基线必须是编辑器打开前的那份**：此刻真源已被编辑器写脏，现读等于
+        # 把脏内容当"原样"（`smoke-edit` 第 3 节逮过这个回归）。
+        result = apply_text(app, session, after, restore_to=before.splitlines())
+        if not result["ok"]:
             print("编辑后的程序没有通过静态校验，真源已恢复原样；"
-                  "你的编辑留在了 %s" % rejected.name, file=sys.stderr)
-            for diag in errors:
-                print("  %s %s: %s" % (diag.level, diag.code, diag.message),
+                  "你的编辑留在了 %s" % os.path.basename(result["rejected"]),
+                  file=sys.stderr)
+            for err in result["errors"]:
+                print("  %s %s: %s" % (err["level"], err["code"], err["message"]),
                       file=sys.stderr)
             return 1
-        session.app.push_snapshot("rebuild", "手写程序模式编辑前兜底存档", "driver")
-        diags = session.load_source(after_lines, origin="driver")
-        _print_diags(diags, False)
-        session.app.append_decision("手写程序模式编辑真源",
-                                    "编辑器整份替换（人确认），%d 行" % len(after_lines),
-                                    "全程序")
+        _print_diags(result["diagnostics"], False)
         print("已应用并重载（写前有兜底快照，可回滚）。")
         return 0
     print("已取消：文件保持你编辑后的样子，但程序未采用它"
@@ -388,7 +492,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="puppethub",
                                  description="OpenPuppet 的搭建与运行软件")
     ap.add_argument("--json", action="store_true", help="输出机读结果（诊断也走这里）")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--no-llm", action="store_true", default=None,
+                    help="无 LLM：首页只开社会台；`run` 等同控制面（写者=驱动者）")
+    # 不 required：**裸跑就是首页**（一个项目都没有时的那一屏）。
+    sub = ap.add_subparsers(dest="cmd", required=False)
 
     p_new = sub.add_parser("new", help="生成最小可用骨架")
     p_new.add_argument("name", help="app 目录名")
@@ -398,8 +505,12 @@ def main(argv=None) -> int:
 
     p_run = sub.add_parser("run", help="打开窗口运行 app")
     p_run.add_argument("app", help="app 目录")
-    p_run.add_argument("--no-llm", action="store_true",
+    p_run.add_argument("--no-llm", action="store_true", default=None,
                        help="控制面模式（无 LLM 实例，写者是驱动者）")
+    p_run.add_argument("--hub-port", type=int, default=None,
+                       help="协作总线端口（首页 open / hub 编排时注入；缺省不接入总线）")
+    p_run.add_argument("--listen-port", type=int, default=None,
+                       help="本实例的协作监听端口（首页 open 注入）：有它才收得到 tell")
     p_run.add_argument("--wipe-memory", action="store_true",
                        help="启动前清空运行期记忆（不给这个开关就一律保留）")
     p_run.set_defaults(func=cmd_run)
@@ -419,9 +530,19 @@ def main(argv=None) -> int:
     p_ci.add_argument("--filter", default="", help="只跑名字含该串的用例")
     p_ci.set_defaults(func=cmd_verify_ci)
 
+    p_keys = sub.add_parser("keys", help="凭据：清单 / 录入 / 撤销 / 探活与泄漏自检")
+    p_keys.add_argument("action", choices=["list", "set", "clear", "check"])
+    p_keys.add_argument("name", nargs="?", help="set/clear 时的变量名")
+    p_keys.add_argument("--env", action="store_true",
+                        help="set 时写进**环境变量**（持久；缺省写钥匙串）")
+    p_keys.add_argument("--keystore", action="store_true",
+                        help="clear 时删钥匙串（缺省清环境变量）")
+    p_keys.add_argument("--app", default=None, help="针对某个 app（读它的 provider 配置）")
+    p_keys.set_defaults(func=cmd_keys)
+
     p_hub = sub.add_parser("hub", help="多 app 编排（发现 / 拉起 / 停止 / 健康检查）")
     p_hub.add_argument("dir", help="父目录")
-    p_hub.add_argument("action", choices=["list", "up", "down", "status"])
+    p_hub.add_argument("action", choices=["list", "up", "down", "status", "bus"])
     p_hub.add_argument("--base-port", type=int, default=8800)
     p_hub.set_defaults(func=cmd_hub)
 
@@ -447,6 +568,10 @@ def main(argv=None) -> int:
     p_build.set_defaults(func=cmd_build)
 
     args = ap.parse_args(argv)
+    if args.no_llm is None:            # 全局与子命令两处都可能给，取"谁给了谁算"
+        args.no_llm = False
+    if args.cmd is None:
+        return cmd_home(args)
     return args.func(args)
 
 
