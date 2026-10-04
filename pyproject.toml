@@ -1,0 +1,47 @@
+# 分发定稿（V2 阶段 1）：版本真源 = PyPI，`pip install puppethub` 承担依赖解析——
+# 自动拉 openpuppet-language（其 wheel 按 data-files 带 spec/ + conformance/，见语言仓
+# pyproject）与钉死的 flet。启动时 compat 校验版本**与数据文件**，残缺安装当场可见。
+# 否决过：zip / 仓库直装（spec/ 会漂移出第二份）、安装包（打包流水线坑）。
+[project]
+name = "puppethub"
+version = "0.1.0"
+description = "OpenPuppet 的搭建与运行软件：让 LLM 孕育并驱动应用。"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "None-Ptr" }]
+keywords = ["agent", "llm", "gui", "flet", "app-builder"]
+# 3.11 起才有 stdlib 的 tomllib——`puppethub.toml` 的解析用它（不引第三方依赖）。
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: User Interfaces",
+]
+dependencies = [
+    # 语言标准实现（规范 + conformance + 参考实现）。
+    # 范围收窄到 2.1：真源写回（序列化器）与 dialog 节点都在 2.1 落地，V1 主路径依赖前者。
+    # 语言继续出修订时同一 app 的行为可能不同而人看不出来，故宁可拒绝启动。
+    "openpuppet-language>=2.1,<2.2",
+    # 渲染**绑定** flet——它不是可插拔槽位，是产品的一部分。
+    # 钉死版本：0.86 与 1.0 的 API 差异极大（字段改名、Signatures 变 kwargs）。
+    "flet==0.86.5",
+]
+
+[project.scripts]
+puppethub = "puppethub.cli:main"
+
+[build-system]
+requires = ["setuptools>=62"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["puppethub*"]

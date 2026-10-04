@@ -1,0 +1,33 @@
+.codebuddy
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+/dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+# 用户在本仓里跑 puppethub new 出来的实验 app（myapp/ 及同类）
+myapp/
+build-dist/
+build-work/
+# PyInstaller 冻结态的中间目录（spec 在 packaging/，产物进 dist/）
+*.manifest
+# app 实例的运行期目录（若在仓内起过 app）
+.puppet/
+.puppethub/
+.puppethub-hub/
+# 设计文档不进版本库（既定决议）；机制冒烟 / 探针 / 夹具进（CI 与他人可跑）。
+docs/*
+!docs/smoke-*.py
+!docs/probe-flet-fields.py
+!docs/fixtures/
+!docs/fixtures/**

@@ -1,0 +1,55 @@
+# V3：自动化 / CI 接入。
+#
+# CI 跑三件事，都以退出码说话：
+# 1. `verify-ci` —— 产品渲染器跑全量 conformance（118 用例，经 puppethub.protocol）；
+#    语言包按版本真源从 PyPI 安装（openpuppet-language==2.1）。
+# 2. 机制冒烟 —— docs/ 的 smoke-*.py 已通过 .gitignore 白名单进版本库（设计文档
+#    仍不进，是既定决议）：协议外壳 / 控制面 / 记忆 / V2 边界 / hub / 融合 / edit /
+#    build / society 全部机制型（假 provider、FLET_APP_HIDDEN），CI 可跑。
+# 3. `compileall` —— 字节码编译过一遍，低级语法错误进不了主干。
+#
+# flet 的"headless 不是免费项"（设计 spike 2 结论）：无显示器环境需要 X，
+# 统一用 xvfb-run 包住 verify-ci 与开窗口的冒烟。首次真实触发若还缺系统库，
+# CI 会以可见失败列出——补装即可，不假装绿。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 flet 无头运行所需的系统库（X 虚拟显示等）
+        run: sudo apt-get update && sudo apt-get install -y xvfb libglib2.0-0 libgl1
+
+      - name: 安装语言标准实现（版本真源 = PyPI）
+        run: pip install "openpuppet-language==2.1"
+
+      - name: 安装 puppethub
+        run: pip install -e .
+
+      - name: 自证（产品渲染器 × 全量 conformance）
+        run: xvfb-run -a python -m puppethub verify-ci
+
+      - name: 机制冒烟（协议 / 控制面 / 记忆 / V2 / hub / 融合 / edit / build / society / 窗口 / LLM 回路）
+        run: |
+          for f in docs/smoke-*.py; do
+            echo "::group::$f"
+            xvfb-run -a python "$f" || { echo "::endgroup::"; exit 1; }
+            echo "::endgroup::"
+          done
+
+      - name: 渲染层字段面探针（重跑即校验 flet 依赖的字段没漂）
+        run: xvfb-run -a python docs/probe-flet-fields.py
+
+      - name: 字节码编译检查
+        run: python -m compileall -q puppethub
