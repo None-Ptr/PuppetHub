@@ -58,6 +58,7 @@ class AppBinding:
             sys.stderr.write("[render] %s: %s\n" % (code, message))
         sys.stderr.flush()
         self.page.update()
+        self.renderer.restore_focus()
 
     async def handle(self, request: dict) -> dict:
         op = request.get("op")

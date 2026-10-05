@@ -45,6 +45,9 @@ class HubWindow:
         self._stage = (0, 0)
         self._applied_declared = None
         self._close_dialog: ft.Control | None = None   # 关窗拦截框（共享 page.overlay）
+        # input 打字的 change → 合并重绘（见 _on_event / _defer_repaint）。
+        self._defer_timer: threading.Timer | None = None
+        self._defer_lock = threading.Lock()
 
     # ------------------------------------------------------------ 启动
 
@@ -163,8 +166,7 @@ class HubWindow:
         threading.Thread(target=serve_tcp, args=(binding, port, server),
                          daemon=True, name="society-listen").start()
         self.session.note("info", "SOCIETY_LISTEN",
-                          "窗口实例已监听 127.0.0.1:%d（可被 tell / who / fire / call）"
-                          % port)
+                          "窗口实例已监听 127.0.0.1:%d" % port)
 
     def _schedule_repaint(self) -> None:
         """TCP 线程上被调到：**只排队**，真正的重绘回到窗口自己的事件循环。
@@ -175,8 +177,7 @@ class HubWindow:
         try:
             self.page.run_task(self._repaint_on_loop)
         except Exception as ex:  # noqa: BLE001
-            self.session.note("warning", "REPAINT",
-                              "跨线程重绘不可用：%s（界面会在下次本机操作时刷新）" % ex)
+            self.session.note("warning", "REPAINT", "跨线程重绘不可用：%s" % ex)
 
     async def _repaint_on_loop(self) -> None:
         try:
@@ -246,7 +247,41 @@ class HubWindow:
 
     def _on_event(self, node_id: str, event: str, row, value) -> None:
         self.session.fire(node_id, event, row, value)
-        self.repaint()
+        node = self.session.engine.program.nodes.get((node_id or "").lstrip("#"))
+        if event == "change" and node is not None and node.type == "input":
+            # 打字：值已经 `_sync_widget_value` 进状态，部件显示的就是用户输入——
+            # **不要**每个按键都全量重绘：整棵树重建会把输入框换成新实例，焦点与
+            # 输入法当场被打断（实测"一输入就消失"）。合并到打字停顿后再刷；
+            # 渲染器侧输入框实例已跨帧复用，这里是第二道保险（降低重建频率）。
+            self._defer_repaint()
+        elif (event in ("focus", "blur") and node is not None and node.type == "input"
+              and not self._declared_handler(node_id, event)):
+            # 程序没声明 focus/blur 处理器：这个事件在语义上什么都不会变，重绘
+            # 唯一的效果就是把正聚焦的输入框重挂载、焦点当场丢掉（实测"点进
+            # 输入框打不了字"）。不刷。
+            pass
+        else:
+            self.repaint()
+
+    def _declared_handler(self, node_id: str, event: str) -> bool:
+        target = (node_id or "").lstrip("#")
+        return any(h.target.lstrip("#") == target and h.event == event
+                   for h in self.session.engine.program.handlers)
+
+    def _defer_repaint(self, delay: float = 0.3) -> None:
+        """合并连续触发的重绘：只在最后一次触发后 `delay` 秒才真的刷一次。
+
+        走 `_schedule_repaint`（它负责把 `page.update` 送回 UI 线程——跨线程
+        直接 update 是踩过的坑）。用户连续打字时定时器不断后移，一次都不刷；
+        停顿后刷一次。期间任何 click / submit 仍走 `repaint` 立即上屏。
+        """
+        with self._defer_lock:
+            if self._defer_timer is not None:
+                self._defer_timer.cancel()
+            timer = threading.Timer(delay, self._schedule_repaint)
+            timer.daemon = True
+            self._defer_timer = timer
+        timer.start()
 
     def repaint(self) -> None:
         """拉一次观察面 → 重画 app → 刷新驾驶舱 → 上屏。"""
@@ -261,15 +296,17 @@ class HubWindow:
                 self.stage_empty.visible = len(self.session.engine.program.nodes) <= 4
             stage = self._stage if self._stage[0] else (0, 0)
             self.stage_meta.value = (
-                "%s · %s×%s · %d 节点 · geometry %s"
+                "%s │ %s×%s │ %d 节点 │ geometry %s"
                 % (self.session.app.name, stage[0] or "?", stage[1] or "?",
                    len(self.session.engine.program.nodes),
-                   "✗ 报不出（对齐无法核对；x/y 仍生效）"
-                   if not rendering["geometry"] else "✓"))
+                   "报不出"
+                   if not rendering["geometry"] else "正常"))
         if self.cockpit is not None:
             self.cockpit.refresh_views()
         self._fit_window()
         self.page.update()
+        if self.renderer is not None:
+            self.renderer.restore_focus()
 
     def _on_resize(self, _event=None) -> None:
         """窗口尺寸变化 → 重算竖向预算（用户拖窗口也要保持比例可用）。"""

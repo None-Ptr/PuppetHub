@@ -52,3 +52,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["puppethub*"]
+
+# 包内数据文件：内置技能（builtin_skills/*.md）随 wheel 走——skill 是 .md 文件
+# 而不是代码，"放文件即生效"的另一半是"随包分发也要真的把文件带上"。
+[tool.setuptools.package-data]
+puppethub = ["builtin_skills/*.md"]

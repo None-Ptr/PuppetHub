@@ -1,4 +1,4 @@
-"""插件体系：统一 `PluginAPI` + 三个槽位 + 目录扫描发现。
+"""插件体系：统一 `PluginAPI` + 四个槽位 + 目录扫描发现。
 
 三条不可动摇的边界：
 
@@ -25,10 +25,13 @@ from typing import Callable, Dict, Iterable, List, Optional
 
 from puppet import Diagnostic, ERROR, INFO, WARNING
 
-SLOTS = ("llm_provider", "storage", "prompt")
+SLOTS = ("llm_provider", "storage", "prompt", "style")
 
 # 单选槽位的内置默认（零配置能跑）；显式指定不存在的名字 → 可见报错并列出可用值。
-DEFAULT_SLOT = {"llm_provider": "openai-compat", "storage": "file", "prompt": "default"}
+# style：给共作者的"观感配方"（进 prompt、不碰渲染路径）——界面永远由程序决定，
+# 风格插件只教 LLM 怎么把词汇表用得体面。
+DEFAULT_SLOT = {"llm_provider": "openai-compat", "storage": "file", "prompt": "default",
+                "style": "plain"}
 
 # 用户插件目录：**放文件即生效**（不必 pip install）。
 USER_PLUGIN_DIR = os.path.join(os.path.expanduser("~"), ".puppethub", "plugins")
@@ -183,8 +186,10 @@ class PluginRegistry:
             % (plugin.name, plugin.source, "、".join(plugin.provides))))
 
     def load_builtins(self) -> None:
-        from .builtin_plugins import default_prompt, file_storage, openai_compat
-        for module in (file_storage, openai_compat, default_prompt):
+        from .builtin_plugins import (default_prompt, file_storage, openai_compat,
+                                      phosphor_style, styles)
+        for module in (file_storage, openai_compat, default_prompt,
+                       styles, phosphor_style):
             plugin = LoadedPlugin(
                 name=module.NAME, source="内置",
                 provides=list(module.PROVIDES),
@@ -235,7 +240,7 @@ def select_slots(registry: PluginRegistry, config: dict,
     names: Dict[str, object] = {}
 
     single = {}
-    for slot in ("llm_provider", "storage"):
+    for slot in ("llm_provider", "storage", "style"):
         requested = config.get(slot)
         if requested is None:
             requested = DEFAULT_SLOT[slot]

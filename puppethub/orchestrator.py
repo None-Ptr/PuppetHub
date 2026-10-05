@@ -430,13 +430,13 @@ class Orchestrator:
                      % (view["status"].get("bus_port") or "未上线"))
         for entry in view["bus_tail"]:
             if entry.get("delivery"):
-                lines.append("  · 投递回执 %s → ok=%s failed=%s"
+                lines.append("  │ 投递回执 %s → ok=%s failed=%s"
                              % (entry.get("from"), entry["delivery"].get("ok"),
                                 entry["delivery"].get("failed")))
             elif entry.get("error"):
-                lines.append("  · %s" % entry["error"])
+                lines.append("  │ %s" % entry["error"])
             else:
-                lines.append("  · %s [%s] %s：%s"
+                lines.append("  │ %s [%s] %s：%s"
                              % (entry.get("from"), entry.get("topic"),
                                 entry.get("title") or "-",
                                 (entry.get("text") or "")[:120]))
@@ -445,7 +445,7 @@ class Orchestrator:
         if self.memory is not None:
             storage = getattr(self.memory, "storage", None)
             for problem in (getattr(storage, "problems", None) or []):
-                lines.append("  · %s" % problem)
+                lines.append("  │ %s" % problem)
         lines.append("【社会层】自主：%s；自主白名单：%s；目标：%s"
                      % ("开" if self.enable else "关",
                         "、".join(view["allow"]) or "空",
@@ -705,6 +705,47 @@ class Orchestrator:
         return ""
 
     # ------------------------------------------------------------ 自主
+
+    def reconfigure(self) -> dict:
+        """重读 `orchestrator.toml` 并**热重建 provider**——设置浮层改完模型就调它。
+
+        三步都不静默，返回 `{ok, profile, note, error}`：
+
+        1. 重读原始表与 merged config（`allow` / 预算一并当场生效）；
+        2. `resolve_model` + `build_provider` 重造 LLM——失败时 provider 置 None 并留 error；
+        3. `enable` = "配置要自主" 且 "模型真的在"：模型没了就把自主**可见地**停下
+           （不是一个还能被触发的开关）。
+
+        为什么不要求重启首页：首页是社会层宿主（`docs/design-home.md` §4），重启等于
+        把总线和所有已接线的小孩一起关掉——为一个模型付这个代价不值。
+        """
+        self.raw_config = read_config()
+        self.config = dict(DEFAULTS)
+        for section in ("autonomous", "society"):
+            for key, value in (self.raw_config.get(section) or {}).items():
+                self.config[key] = value
+        model = resolve_model(self.raw_config)
+        provider, error = None, model.get("error") or ""
+        if not error:
+            provider, error = build_provider(model.get("options") or {}, log=self.log)
+        previous = self.provider
+        self.provider = provider
+        self.provider_error = error or ""
+        enable_config = bool(self.config.get("enable", True))
+        self.enable = enable_config and provider is not None
+        if self.enable:
+            self.start_autonomous()
+        notes = []
+        if model.get("note"):
+            notes.append(model["note"])
+        if provider is not None:
+            notes.append("调度官已换到 profile=%s" % (model.get("profile") or "（自动）"))
+        elif previous is not None and enable_config:
+            notes.append("模型不可用，自主回路已停下")
+        text = "；".join(notes) or "重读配置：没有变化"
+        self.log("info" if provider is not None else "error", "ORCH_RECONFIG", text)
+        return {"ok": provider is not None, "profile": model.get("profile") or "",
+                "note": text, "error": self.provider_error}
 
     def start_autonomous(self) -> None:
         if self._worker is not None or not self.enable:

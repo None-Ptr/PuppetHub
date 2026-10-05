@@ -34,7 +34,12 @@ def compact(contracts: Iterable[dict]) -> list[dict]:
 
 
 def prompt_block(entries: list[dict]) -> str:
-    """上下文里的紧凑清单：只有签名 + 说明首行（说明全文按需取）。"""
+    """上下文里的紧凑清单：只有签名 + 说明首行。
+
+    "说明全文按需取"由 `context.capability_docs` 兑现：程序正在调用或请求
+    点名的能力，其 docstring 全文经 `capability_docs` 键注入 prompt（触碰前
+    LLM 只见首行，调错靠 `CALL_CONTRACT` 诊断回灌试错）。
+    """
     if not entries:
         return "（本 app 尚未提供任何能力）"
     lines = []

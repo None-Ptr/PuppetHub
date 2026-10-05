@@ -24,6 +24,7 @@ from typing import Callable, Iterable, Optional
 import flet as ft
 
 from puppet import vocab
+from puppet.lang import Ref
 
 _MISSING = object()
 _EATEN = object()
@@ -293,6 +294,13 @@ class FletRenderer:
         # 部件表：地址 → [(行序号或 None, 部件)]。用户动作投递要找到**真实部件**，
         # 由它自己的事件绑定翻译成引擎事件——而不是绕过界面直接 shot 进引擎。
         self._controls: dict[str, list] = {}
+        # 输入框实例表：(地址, 行序号) → ft.TextField。apply 每帧重建整棵树，
+        # 但**输入框不能换新**——新实例 = 新 uid = flet 当成新控件 = 焦点与输入法
+        # 被打断（实测"一输入就消失"）。跨帧复用同一个 Python 对象（见 _build_input）。
+        self._inputs: dict = {}
+        self._prev_inputs: dict = {}
+        self._input_outer: dict = {}           # (地址,行)→ 输入框外层容器，跨帧复用
+        self._focused_key = None           # 当前聚焦的输入框 (地址, 行)；恢复焦点用
         self._event_diags: list = []
         self._overlay_owned: list = []      # 本渲染器上一帧放进 page.overlay 的覆盖层
         self._window_applied: dict = {}     # 我们上次写进真实窗口的尺寸/位置
@@ -305,6 +313,8 @@ class FletRenderer:
         self.notes = []
         self._snap = snap
         self._controls = {}
+        self._prev_inputs = self._inputs
+        self._inputs = {}
         program = self.engine.program
 
         roots = []
@@ -624,13 +634,17 @@ class FletRenderer:
         elif node.type in ("checkbox", "switch", "slider", "dropdown"):
             control.on_change = self._handler(node_id, "change", row_index, takes_value=True)
         elif node.type == "input":
-            # 打字本身不是"需要被响应的动作"（规范 4 节），故不接 `change`；
-            # 提交才是动作，失焦/聚焦是状态。
+            # 打字本身不是"需要被响应的动作"（规范 4 节）——但**值必须同步进状态**：
+            # 程序里 `when #amount.value != ""` 这类"点按时读输入"的写法依赖它，
+            # 而只接 `submit` 时它是声明初值（`""`）⇒ 条件恒假、点了没反应、且无诊断
+            #（实测就是这么坏的）。接 `change` 只为"值 → 状态"（引擎 `fire` 里
+            # `_sync_widget_value`）；程序没写 change 处理器时，它没有别的副作用。
+            control.on_change = self._handler(node_id, "change", row_index, takes_value=True)
             control.on_submit = self._handler(node_id, "submit", row_index, takes_value=True)
             control.on_focus = self._handler(node_id, "focus", row_index)
             control.on_blur = self._handler(node_id, "blur", row_index)
         if _supports(type(control), "on_hover"):
-            control.on_hover = self._hover_handler(node_id)
+            control.on_hover = self._hover_handler(node)
 
     def _handler(self, node_id: str, event: str, row_index, takes_value: bool = False):
         def handler(event_obj=None):
@@ -754,17 +768,24 @@ class FletRenderer:
             return control.value
         return getattr(event_obj, "data", None)
 
-    def _hover_handler(self, node_id: str):
+    def _hover_handler(self, node):
         def handler(event_obj=None):
             data = str(getattr(event_obj, "data", "")).lower()
             entered = data in ("true", "1", "yes")
-            was = node_id in self._hover
+            was = node.id in self._hover
             if entered:
-                self._hover.add(node_id)
+                self._hover.add(node.id)
             else:
-                self._hover.discard(node_id)
-            # 只在真的变化时重绘，否则鼠标一动就重画整棵树。
-            if was != entered and self.on_local_change is not None:
+                self._hover.discard(node.id)
+            # 只在真的变化时才考虑重绘，否则鼠标一动就重画整棵树。
+            if was == entered or self.on_local_change is None:
+                return
+            # 重绘 = 整树重建 = 焦点重挂载。只为真声明了 hover 外观的控件付
+            # 这个代价；按钮的状态样式是 flet 原生（ButtonStyle），一次都不用。
+            if node.type == "button":
+                return
+            states = self._val(node.id, "states", self._snap, None)
+            if isinstance(states, dict) and "hover" in states:
                 self.on_local_change()
         return handler
 
@@ -916,8 +937,91 @@ class FletRenderer:
 
     def _build_input(self, node, snap, row, row_index):
         value = self._val(node.id, "value", snap, row)
-        inner = ft.TextField(value="" if value is _MISSING else value)
-        return self._decorate(node, inner, snap, row, row_index, eaten=("value",))
+        key = (node.id, row_index)
+        value_expr = node.attrs.get("value")
+        bound = isinstance(value_expr, Ref)     # value 绑定数据/其他节点 = 外部真值
+        in_row = row_index is not None
+        inner = self._prev_inputs.get(key)
+        # 行内且**未绑定**的输入框：不把声明值写回部件——行实例共享一个状态
+        # （引擎对这种输入跳过值同步并给 ROW_INPUT_SHARED 警告），每帧重设
+        # 声明初值会把用户正在打的字清掉。保留部件当前值 = 用户输入还在。
+        keep_user_value = in_row and not bound
+        # 输入框持有焦点期间**绝不回写 value**：flet 对焦点中的 TextField 改
+        # value，Flutter 端会把整段文本全选（实测"一输入就全选"）。此刻部件本身
+        # 就是真值（状态经 change 事件同步）；外部改值等失焦后下一帧再对齐。
+        focused = key == self._focused_key
+        if isinstance(inner, ft.TextField):
+            # **复用实例**（uid 不变）：apply 每帧重建整棵树，而打字的 on_change
+            # 正是 repaint 的触发者——不复用的话，上一个字触发的重绘会把正打的
+            # 这个字的输入框换成新实例，焦点与输入法当场中断（实测"一输入就消失"）。
+            # 复用后 flet 只 diff 属性：值与部件当前值相同则连更新都不发。
+            if not keep_user_value and not focused:
+                new_value = "" if value is _MISSING else value
+                if new_value != inner.value:     # 值没变就别碰部件
+                    inner.value = new_value
+        else:
+            inner = ft.TextField(value="" if value is _MISSING else value)
+        self._inputs[key] = inner
+        outer = self._decorate(node, inner, snap, row, row_index, eaten=("value",))
+        # 外层容器也跨帧复用：输入框带 pad/bgcolor/border 时 `_decorate` 会套一层
+        # `ft.Container`，若每帧都新建，外层 uid 变 → flet 把整个子树重挂载 →
+        # 焦点/输入法当场丢失（实测"点进去打不了字"）。复用外层 = 父链稳定 =
+        # flet 不重挂载，焦点自然保留（restore_focus 只作兜底）。
+        cached = self._input_outer.get(key)
+        if cached is not None:
+            self._copy_box(cached, outer)        # 把本帧的盒/可见/禁用/动效同步过去
+            outer = cached
+        else:
+            self._input_outer[key] = outer
+        # 焦点跟踪：apply 整树重建会把 flet 控件重挂载，焦点当场被夺走
+        # （实测"点进去打不了字 / 打一个字就断"）。记住谁在焦点，宿主
+        # page.update() 之后再还给它（restore_focus）。
+        wired_focus, wired_blur = inner.on_focus, inner.on_blur
+
+        def _track_focus(event_obj=None, _cb=wired_focus, _key=key):
+            self._focused_key = _key
+            if _cb:
+                _cb(event_obj)
+
+        def _track_blur(event_obj=None, _cb=wired_blur, _key=key):
+            if self._focused_key == _key:
+                self._focused_key = None
+            if _cb:
+                _cb(event_obj)
+
+        inner.on_focus = _track_focus
+        inner.on_blur = _track_blur
+        return outer
+
+    def restore_focus(self) -> None:
+        """宿主 `page.update()` 之后调用：把焦点还给重绘前聚焦的输入框。
+
+        必须在 update 之后调——`focus()` 是发给客户端的指令，控件还没上屏时
+        调了也白发。没有焦点输入框时是 no-op；已聚焦时重复 focus 在客户端
+        是幂等的。无窗口（冒烟）时静默跳过。
+        """
+        if self._focused_key is None:
+            return
+        control = self._inputs.get(self._focused_key)
+        if control is None or not hasattr(control, "focus"):
+            return
+        run_task = getattr(self.page, "run_task", None)
+        if run_task is None:
+            return
+        try:
+            run_task(control.focus)
+        except Exception:  # noqa: BLE001 - 恢复焦点尽力而为，失败不炸渲染
+            pass
+
+    @staticmethod
+    def _copy_box(dst, src) -> None:
+        """把盒模型/可见/禁用/动效从本帧外层 `src` 同步到复用的 `dst`（父链稳定）。"""
+        for attr in ("padding", "bgcolor", "border", "margin",
+                     "visible", "disabled", "expand", "animate"):
+            try:
+                setattr(dst, attr, getattr(src, attr))
+            except Exception:  # noqa: BLE001 - 个别属性类型不匹配就跳过，不阻断
+                pass
 
     def _build_checkbox(self, node, snap, row, row_index):
         value = self._val(node.id, "value", snap, row)

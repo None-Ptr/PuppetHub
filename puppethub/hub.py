@@ -244,8 +244,8 @@ def main(argv=None) -> int:
         prog="puppethub.hub", description="多 app 编排（发现 / 生命周期 / 健康检查）")
     parser.add_argument("dir", help="父目录（其下含 app.puppet 的子目录视为 app）")
     parser.add_argument("action", choices=["list", "up", "down", "status", "bus"],
-                        help="list=发现 · up=拉起（含协作总线）· down=停止 · "
-                             "status=健康检查 · bus=协作审计尾部")
+                        help="list=发现 │ up=拉起（含协作总线）│ down=停止 │ "
+                             "status=健康检查 │ bus=协作审计尾部")
     parser.add_argument("--base-port", type=int, default=DEFAULT_BASE_PORT)
     args = parser.parse_args(argv)
     parent = Path(args.dir).resolve()

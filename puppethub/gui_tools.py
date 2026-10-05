@@ -81,10 +81,12 @@ class GuiTools:
 
     def create_app_now(self, parent: str, name: str, title: str = "") -> dict:
         """CLI `new`：生成骨架 + **静态校验**（骨架零诊断是它的契约）。"""
+        from . import recent
         from .appdir import create_app
         from .fusion import _dry_run
         app = create_app(parent, name, title or None)
         errors = _dry_run(app.read_source())
+        recent.record(app.root)        # 新建成功即入册——首页列表的真源是 MRU
         return {"root": str(app.root),
                 "errors": [{"level": d.level, "code": d.code, "message": d.message}
                            for d in errors]}
@@ -101,10 +103,10 @@ class GuiTools:
             return False
         log("已生成独立 flet 工程：%s" % result["out_dir"])
         for rel in result["files"]:
-            log("  · %s" % rel)
+            log("  │ %s" % rel)
         for note in result.get("notes") or []:
-            log("· %s" % note)
-        log("手机上写者=无（改程序回桌面改 app.puppet 再 build）")
+            log("│ %s" % note)
+        log("手机上写者=无")
         if not also_run:
             log("构建：cd \"%s\" && flet build %s" % (result["out_dir"], target))
             return True
@@ -114,7 +116,7 @@ class GuiTools:
         if not outcome["ok"]:
             log("失败：%s" % (outcome.get("error") or "flet build 失败"))
             return False
-        log("构建完成（产物见 flet build 输出）")
+        log("构建完成")
         return True
 
     def hub_now(self, action: str, base_port: int = 8800,
@@ -125,7 +127,7 @@ class GuiTools:
         log("目录：%s（base-port %d）" % (parent, base_port))
         if action == "list":
             for app in hubmod.discover(parent):
-                log("  · %s" % app.name)
+                log("  │ %s" % app.name)
         elif action == "up":
             for item in hubmod.up(parent, base_port=base_port):
                 log("  %s → 端口 %s（握手 %s）"
@@ -134,7 +136,7 @@ class GuiTools:
             log("协作总线端口：%s" % hubmod._load_state(parent).get("bus_port"))
         elif action == "down":
             hubmod.down(parent)
-            log("已停止（账本保留：再次 up 幂等拉起）")
+            log("已停止")
         elif action == "status":
             for row in hubmod.status(parent):
                 log("  %s 端口 %s 存活 %s"
@@ -142,7 +144,7 @@ class GuiTools:
         elif action == "bus":
             entries = hubmod.bus_entries(parent, limit=30)
             if not entries:
-                log("（总线还没有审计记录：app 之间还没说过话）")
+                log("（总线还没有审计记录）")
             for entry in entries:
                 if "delivery" in entry:
                     log("  %s 投递回执 %s.%s → ok=%s failed=%s"
@@ -168,14 +170,14 @@ class GuiTools:
         plan["b"] = str(b.root)
         report = audit_plan(a, b, plan)
         log("plan：renames=%s" % (plan.get("renames") or {}))
-        log("      caps=%s · window_title=%s"
+        log("      caps=%s │ window_title=%s"
             % (plan.get("caps") or {}, plan.get("window_title")))
         log("      intent=%s" % plan.get("intent"))
         log("依赖对照：A〔%s〕← B〔%s〕"
             % (report["deps"]["a"] or "未填", report["deps"]["b"] or "未填"))
         for error in report["errors"]:
             log("拒绝：%s" % error)
-        log("体检：%s" % ("通过——确认后可执行" if report["ok"] else "未通过"))
+        log("体检：%s" % ("通过" if report["ok"] else "未通过"))
         return report["ok"]
 
     def fuse_now(self, b_path: str, log: Callable[[str], None] = print) -> bool:
@@ -193,7 +195,7 @@ class GuiTools:
         if not report["ok"]:
             for error in report["errors"]:
                 log("拒绝：%s" % error)
-            log("体检未通过：不执行（一个字节都没写）")
+            log("体检未通过：不执行")
             return False
         result = fuse(a, b, plan)
         if not result["ok"]:
@@ -202,7 +204,7 @@ class GuiTools:
             return False
         log("融合完成：合并后 %d 行；B 已归档为 %s"
             % (result["merged_lines"], result["archive"]))
-        log("撤销路径：操作 » 回滚 选 rebuild 那一份（执行前有兜底快照）")
+        log("撤销路径：操作 » 回滚 选 rebuild 那一份")
         return True
 
     def human_edit_check(self, text: str) -> dict:
@@ -319,7 +321,7 @@ class GuiTools:
         base_field = field(eff.get("base_url") or "", hint="https://api.deepseek.com/v1")
         model_field = field(eff.get("model") or "", hint="deepseek-chat")
         env_field = field(eff.get("key_env") or "OPENAI_API_KEY", hint="DEEPSEEK_API_KEY")
-        key_field = field("", hint="粘贴凭据（不回显）；留空 = 不改", password=True)
+        key_field = field("", hint="粘贴凭据（留空 = 不改）", password=True)
         status = mono("", size=SIZE_MICRO, color=DIM, selectable=False)
 
         def refresh_status() -> None:
@@ -332,15 +334,15 @@ class GuiTools:
                 info = layers.get(name) or {}
                 marks = []
                 if info.get("keystore"):
-                    marks.append("钥匙串 ✓")
+                    marks.append("钥匙串")
                 if info.get("env"):
-                    marks.append("环境变量 ✓（第一优先）")
+                    marks.append("环境变量")
                 if not marks:
                     marks.append("未设置")
-                lines.append("%-24s %s%s" % (name, " · ".join(marks),
+                lines.append("%-24s %s%s" % (name, " │ ".join(marks),
                                              "  长度 %d" % info["length"]
                                              if info.get("length") else ""))
-            lines.append("生效：%s · %s · %s"
+            lines.append("生效：%s │ %s │ %s"
                          % (current.get("base_url") or "（未设）",
                             current.get("model") or "（未设）", current.get("key_env")))
             if live["profile"]:
@@ -350,8 +352,7 @@ class GuiTools:
             lines.append("本机 profile 表：%s"
                          % ("、".join(live["profiles"]) or "（空）"))
             if any(info.get("env") for info in layers.values()):
-                lines.append("⚠ 环境变量里已有凭据：它优先级更高，会盖过钥匙串里的同名值"
-                             "（「清掉环境变量那把」可撤）")
+                lines.append("⚠ 环境变量里已有凭据：优先级更高，会盖过钥匙串同名值")
             status.value = "\n".join(lines)
             self.page.update()
 
@@ -375,7 +376,6 @@ class GuiTools:
                     button.content.value = "[%s]" % _KEY_TARGET_LABEL[key] if active \
                         else _KEY_TARGET_LABEL[key]
                     button.content.color = TEXT if active else DIM
-                key_hint.value = _KEY_TARGET_HINT[target]
                 self.page.update()
             return handler
 
@@ -394,8 +394,6 @@ class GuiTools:
                       tone=TEXT if name == "keystore" else DIM)
             for name in ("keystore", "env")
         }
-        key_hint = mono(_KEY_TARGET_HINT["keystore"], size=SIZE_MICRO, color=DIM,
-                        selectable=False, md=True)
         profile_row = labeled("profile", profile_field)
         profile_row.visible = scope["value"] == "profile"
         refresh_status()
@@ -416,8 +414,8 @@ class GuiTools:
                 self._log("已写：%s" % path)
             for note in result["notes"]:
                 for line in str(note).splitlines():
-                    self._log("· " + line)
-            self._log("插件已热重载：配置即时生效（凭据值不回显）")
+                    self._log("│ " + line)
+            self._log("插件已热重载：配置即时生效")
             refresh_status()
             self.repaint()
 
@@ -439,17 +437,11 @@ class GuiTools:
 
         self.form("模型设置（base_url / 模型 / 凭据）", [
             # 文案一律**短行**：一屏里挤成一段话就没人读（实测反馈："文字有点密集"）。
-            mono("凭据值永不写进配置文件——只写端点与变量名，值落进选定的一层。",
-                 size=SIZE_MICRO, color=DIM, selectable=False),
             ft.Row(spacing=10, controls=[
                 mono("端点作用域", size=SIZE_DATA, color=DIM, selectable=False, width=84),
                 scope_buttons["app"], scope_buttons["profile"]]),
-            mono("· 本机 profile：端点留本机，app 只留名字 —— **app 可安全分享**",
-                 size=SIZE_MICRO, color=DIM, selectable=False, md=True),
-            mono("· 仅本 app：端点写进 app 配置 —— 分享会带上端点",
-                 size=SIZE_MICRO, color=DIM, selectable=False),
             profile_row,
-            mono("字段：留空 = 不改 · 填 `-` = 清空（回到上一层或默认值）",
+            mono("字段：留空 = 不改 │ 填 `-` = 清空",
                  size=SIZE_MICRO, color=DIM, selectable=False, md=True),
             labeled("base_url", base_field),
             labeled("model", model_field),
@@ -457,7 +449,6 @@ class GuiTools:
             ft.Row(spacing=10, controls=[mono("凭据落点", size=SIZE_DATA, color=DIM,
                                              selectable=False, width=84),
                                          key_buttons["keystore"], key_buttons["env"]]),
-            key_hint,
             labeled("凭据", key_field),
             rule(),
             status,
@@ -493,8 +484,6 @@ class GuiTools:
                 labeled("标题", title_field),
             ], job)
         self.form("新建 app（CLI `new`）", [
-            mono("骨架 = window + navbar + 内容容器，不含业务——意图写进 DESIGN.md。",
-                 size=SIZE_MICRO, color=DIM, selectable=False),
             labeled("父目录", parent_field),
             labeled("名字", name_field),
             labeled("标题", title_field),
@@ -508,13 +497,13 @@ class GuiTools:
         info = mono("", size=SIZE_MICRO, color=DIM, selectable=False)
         rejected = rejected_path(app)
         if rejected:
-            info.value = ("上一份被拒的编辑还在 %s（没通过静态校验；真源已恢复原样）"
+            info.value = ("上一份被拒的编辑还在 %s（真源已恢复原样）"
                           % rejected.name)
 
         def check(_event=None) -> None:
             result = self.human_edit_check(text_area.value or "")
             if not result["ok"]:
-                info.value = "干跑拒绝（%d 项）——应用会被拦下并把拒稿留底：" % len(result["errors"])
+                info.value = "干跑拒绝（%d 项）：" % len(result["errors"])
                 for err in result["errors"][:6]:
                     info.value += "\n  %s %s: %s" % (err["level"], err["code"],
                                                      err["message"])
@@ -533,12 +522,10 @@ class GuiTools:
                     self._log("  %s %s: %s" % (err["level"], err["code"], err["message"]))
                 self._log("拒稿已留底：%s" % Path(result["rejected"]).name)
             else:
-                self._log("已整份替换并重载（写前有兜底快照 rebuild，可回滚）")
+                self._log("已整份替换并重载（可回滚）")
             self.repaint()
 
         self.form("人的写入（CLI `edit`）", [
-            mono("写者=你（origin=driver）：干跑 → 兜底快照 → 整份替换 → 重载。",
-                 size=SIZE_MICRO, color=DIM, selectable=False),
             ft.Container(content=text_area, border=ft.Border.all(1, RULE),
                          padding=6, expand=True),
             info,
@@ -565,7 +552,7 @@ class GuiTools:
 
         def do(also_run: bool):
             def handler(_event=None) -> None:
-                self.run("打包 · %s" % target["value"], [
+                self.run("打包 │ %s" % target["value"], [
                     ft.Row(spacing=10, controls=[buttons["android"], buttons["web"]]),
                     labeled("输出", out_field),
                 ], lambda log: self.export_now(target["value"],
@@ -593,7 +580,7 @@ class GuiTools:
                 except ValueError:
                     self._log("拒绝：端口要是整数")
                     return
-                self.run("编排 · %s" % name, [labeled("起始端口", base_field)],
+                self.run("编排 │ %s" % name, [labeled("起始端口", base_field)],
                          lambda log: self.hub_now(name, base, log))
             return handler
 
@@ -650,7 +637,7 @@ class GuiTools:
         self.form("融合（CLI `fuse`）", [
             mono("**推倒重来级**动作：执行前有兜底快照（rebuild，不参与淘汰）",
                  size=SIZE_MICRO, color=DIM, selectable=False, md=True),
-            mono("B 目录归档改名、不删除 · 先跑「体检（干跑）」再执行",
+            mono("B 目录归档改名、不删除 │ 先跑「体检（干跑）」再执行",
                  size=SIZE_MICRO, color=DIM, selectable=False),
             labeled("B 目录", b_field),
         ], actions=[
@@ -681,26 +668,19 @@ class GuiTools:
                                          getattr(diag, "message", diag)))
                 errors += 1 if level == "错误" else 0
             if not diags:
-                self._log("零诊断（命令批已写入真源，批末自动快照）")
+                self._log("零诊断（已写回真源）")
             elif not errors:
-                self._log("（有提示但无错误；真源已写回）")
+                self._log("（有提示但无错误）")
             input_area.value = ""
             self.repaint()
 
         self.form("命令批（CLI `repl`）", [
-            mono("写者=你（origin=driver）：引擎校验 → 批末写回真源 → 写前自动快照。",
-                 size=SIZE_MICRO, color=DIM, selectable=False),
             ft.Container(content=input_area, border=ft.Border.all(1, RULE), padding=6),
         ], actions=[primary("发送", send), btn("关闭", lambda _e: self._close())])
 
 
 _SCOPE_LABEL = {"app": "仅本 app", "profile": "本机 profile"}
 _KEY_TARGET_LABEL = {"keystore": "钥匙串", "env": "环境变量"}
-_KEY_TARGET_HINT = {
-    "keystore": "钥匙串：0600、app 目录之外，只本用户可读 —— **更安全（推荐）**",
-    "env": "环境变量：持久（新进程也能用）· **同用户每个进程可见** · "
-           "第一优先，会盖过钥匙串同名值",
-}
 CLEAR = "-"                  # 字段填 `-` = 删除该项（空 = 不改）
 
 

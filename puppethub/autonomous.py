@@ -57,7 +57,7 @@ class AutonomousRunner:
     """自主回路的事件入口与预算执行者。决策-行动-观察**完全复用** `Chat`。"""
 
     def __init__(self, session, *, provider, prompts, storage, memory, log,
-                 on_delta: Optional[Callable[[str], None]] = None):
+                 on_delta: Optional[Callable[[str], None]] = None, style=None):
         self.session = session
         self.log = log
         self.config = dict(DEFAULTS)
@@ -66,7 +66,7 @@ class AutonomousRunner:
         self.chat = Chat(
             session, provider=_LockedProvider(provider, self._llm_lock),
             prompts=prompts, storage=storage, memory=memory, log=log,
-            on_delta=on_delta, origin="autonomous",
+            on_delta=on_delta, origin="autonomous", style=style,
             fail_budget=int(self.config["fail_budget"]),
             autonomous_allow=list(self.config["allow_calls"]),
             max_batch_lines=int(self.config["max_batch_lines"]))

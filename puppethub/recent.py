@@ -50,7 +50,7 @@ _PROBLEMS: List[str] = []
 
 
 def _on_error(ex) -> None:
-    message = ("项目列表 %s 读不出来（%s: %s）——按空处理，**不覆盖它**"
+    message = ("项目列表 %s 读不出来（%s: %s）"
                % (path(), type(ex).__name__, ex))
     if message not in _PROBLEMS:
         _PROBLEMS.append(message)

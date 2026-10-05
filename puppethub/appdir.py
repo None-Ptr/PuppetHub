@@ -46,7 +46,7 @@ SKELETON_GITIGNORE = """# 引擎状态 / 记忆 / 快照：都是本机运行产
 .puppet/
 """
 
-SKELETON_CONFIG = '''# PuppetHub 的 app 配置。**零配置也能跑**（全用内置默认）；下面两块按需选一。
+SKELETON_CONFIG = '''# PuppetHub 的 app 配置。**零配置也能跑**（全用内置默认）；下面几块按需选一。
 
 # 方式一（推荐）：用本机命名 profile——端点与凭据名留在
 # ~/.puppethub/providers.toml（机器级），app 里只留名字，
@@ -59,6 +59,10 @@ SKELETON_CONFIG = '''# PuppetHub 的 app 配置。**零配置也能跑**（全�
 # base_url = "https://api.openai.com/v1"
 # model = "gpt-4o-mini"
 # key_env = "OPENAI_API_KEY"      # 只写变量名；值走环境变量或 `puppethub keys set`
+
+# 界面风格（教共作者怎么把界面做体面的配方）：缺省 plain（通用观感纪律）。
+# 可选 "phosphor"（磷光终端：暖黑底 / 等宽字 / 语义色九角色，适合数据与工具类）。
+# style = "phosphor"
 '''
 
 
@@ -130,13 +134,14 @@ class Snapshot:
 
 
 def skeleton_source(title: str) -> list[str]:
-    """`new` 的骨架：**只给布局惯例 + 能跑，不含任何业务**。
+    """`new` 的骨架：**只给布局惯例 + 视觉基调 + 能跑，不含任何业务**。
 
     给完整范例会束缚 LLM——它倾向于在示例上小修小补，而不是把用户要的东西做对；
-    而用户的需求是"做个 X"，不是"改这个 Y"。
+    而用户的需求是"做个 X"，不是"改这个 Y"。视觉基调同理：只给**一处定色**
+    （`primary` 主题种子——Material 全套控件自动跟随），不替它做设计。
     """
     return [
-        "add #root window #win title=%s w=900 h=640" % _quote(title),
+        "add #root window #win title=%s w=900 h=640 primary=#4A6CF7" % _quote(title),
         "add #win navbar #bar title=%s" % _quote(title),
         "add #win col #content pad=16 gap=12 flex=1",
     ]

@@ -59,6 +59,7 @@ puppethub edit <app>            # 正式手写程序模式：编辑器整份替�
 ```toml
 llm_provider = "openai-compat"     # 单选
 storage = "file"                   # 单选
+style = "plain"                    # 单选：界面风格配方（plain / phosphor / 自定义插件）
 prompt = ["default"]               # 多选叠加，按顺序跑
 
 [plugins.openai-compat]
@@ -72,7 +73,7 @@ context_limit = 128000             # provider 自报窗口上限（宿主据此�
 
 ```python
 NAME = "my-provider"
-PROVIDES = ["llm_provider"]        # 可选槽位：llm_provider / storage / prompt
+PROVIDES = ["llm_provider"]        # 可选槽位：llm_provider / storage / prompt / style
 
 def create_llm_provider(api):      # 每个槽位一个工厂
     return MyProvider(api)
@@ -93,7 +94,14 @@ def create_llm_provider(api):      # 每个槽位一个工厂
 - 渲染层：程序 IR + 观察面 → flet 控件树（控件 / 属性 / 动效 / 图标四层映射）
 - **共作者 LLM**：对话通道（后台线程 + 流式上屏）· 指令块协议（命令批 / 整体替换 /
   受限文件写入 / 反问）· 诊断回灌 · 卡住检测 · 危险动作两层确认 · 执行 / 讨论两档
-- 插件体系：三槽位 + 目录扫描发现 + 失败隔离；内置 provider / storage / prompt
+- 插件体系：四槽位（llm_provider / storage / prompt / **style**）+ 目录扫描发现 + 失败隔离；
+  内置 provider / storage / prompt / 风格预设（plain 缺省 · phosphor 磷光终端）
+- **Skill（.md）**：一个 `.md` 文件 = 一份按需注入的领域知识——三级目录放文件即生效
+  （内置 `builtin_skills/` 随包 · app 级 `.puppethub/skills/` **随 app 走** · 用户级
+  `~/.puppethub/skills/`，同名覆盖）；显式触发词命中（请求原文 ∪ 程序源）才注入，
+  没命中零噪音；坏文件可见不静默。设计见 `docs/design-skills.md`
+- **能力文档按需**：签名 + 首行常驻（"有什么"），docstring 全文只在程序调用 /
+  请求点名时注入（"怎么用对"）——调对参数不靠 `CALL_CONTRACT` 试错
 - 驾驶舱：对话 / 观察流与诊断 / 程序只读面板 + 命名快照 · 回滚 · 重载 · 重置 ·
   清记忆 · 自证 · 查看本轮 prompt；**关窗前拦脏状态**
 - **自证**：`puppethub.protocol` 把产品渲染器包成 conformance 可驱动的子进程，
@@ -188,5 +196,6 @@ python docs/smoke-fusion.py          # 融合：审计停下 / IR 改名 / 干�
 python docs/smoke-edit.py            # 手写程序模式：干跑守卫 / 拒稿留底 / 真源恢复
 python docs/smoke-build.py           # 设备打包：manifest 凭据 / REQUIRES 构建期解析 / 独立装载
 python docs/smoke-society.py         # V4：服务化 / 协作总线 / 深度自主，铁律不破
+python docs/smoke-skills.py          # 技能（.md）：触发词命中 / app 级覆盖 / 坏文件可见 / 预算截断
 ```
 

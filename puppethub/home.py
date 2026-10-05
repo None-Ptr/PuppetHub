@@ -30,8 +30,8 @@ BUS_TAIL_LINES = 5
 PROBE_INTERVAL = 2.0
 
 # 快捷键图：**两行**（一行放不下时会自己折成两行，那看起来像排版事故）
-HINTS = ("↑↓ 选择 · Enter 打开 · n 新建 · o 目录 · u 拉起",
-         "d 停止 · f 遗忘 · m 自主 · r 重读 · q 退出")
+HINTS = ("↑↓ 选择 │ Enter 打开 │ n 新建 │ o 目录 │ s 设置",
+         "u 拉起 │ d 停止 │ f 遗忘 │ m 自主 │ r 重读 │ q 退出")
 
 KEYS_UP = ("arrowup", "arrow up", "up")
 KEYS_DOWN = ("arrowdown", "arrow down", "down")
@@ -72,7 +72,7 @@ class HomeWindow:
 
     def _main(self, page: ft.Page) -> None:
         self.page = page
-        page.title = "PuppetHub · 首页"
+        page.title = "PuppetHub │ 首页"
         page.padding = 0
         page.spacing = 0
         page.bgcolor = theme.BG
@@ -116,6 +116,7 @@ class HomeWindow:
                            selectable=False),
                 ft.Container(expand=True),
                 self.model_state,
+                theme.btn("设置", lambda _e: self._settings()),
             ]))
 
     # ------------------------------------------------------------ 左栏：社会台
@@ -209,6 +210,8 @@ class HomeWindow:
             self._act("forget")
         elif key == "m":
             self._toggle_autonomous()
+        elif key == "s":
+            self._settings()
         elif key == "r":
             self._reload(reason="手动重读")
         elif key == "q":
@@ -291,14 +294,14 @@ class HomeWindow:
         bus_port = self.society.bus_port()
         model = "调度官就绪" if (self.orchestrator is not None
                              and self.orchestrator.provider is not None) else "未配置模型"
-        self.status.value = ("%s · 共 %d 项 · 在跑 %d · 总线 %s"
+        self.status.value = ("%s │ 共 %d 项 │ 在跑 %d │ 总线 %s"
                             % (model, len(self.entries), running,
                                ("127.0.0.1:%d" % bus_port) if bus_port else "未上线"))
         self.model_state.value = model
         if self.orchestrator is not None:
             stats = self.orchestrator.stats()
             self.orchestrator_state.value = (
-                "自主：%s · 本小时 %d/%d · allow：%s"
+                "自主：%s │ 本小时 %d/%d │ allow：%s"
                 % ("开" if stats["enable"] else "关", stats["steps_last_hour"],
                    stats["budget_per_hour"], "、".join(stats["allow"]) or "空"))
 
@@ -365,9 +368,10 @@ class HomeWindow:
     def _apply(self, kind: str, payload) -> None:
         if kind == "reload":
             self.rows = payload or []
-            self._render_list()
-            self._render_status()
-            self._render_bus()
+            # **必须重读 MRU**（`entries` 只有 `_reload` 里会变）——曾只重渲染三块，
+            # 于是"新建/打开/忘记之后列表不动"（数据对了、界面用旧快照重画）。
+            # `page.update()` 由 `_pump` 在整批处理后统一做。
+            self._reload()
         elif kind == "log":
             level, text = payload
             self._note_transcript(level, text)
@@ -378,6 +382,10 @@ class HomeWindow:
                 theme.set_md(self._live, "   " + self._stream[-400:], theme.SIZE_DATA)
         elif kind == "turn":
             self._finish_turn(payload)
+        elif kind == "call":
+            # 任意 UI 改动的**线程安全通道**：工作线程想动界面，就丢一段回调到这里，
+            # 由泵在 UI 线程里执行（`page.update()` 不能发生在别的线程）。
+            payload()
         elif kind == "after":
             self._reload()
         elif kind == "closing":
@@ -534,6 +542,15 @@ class HomeWindow:
 
     # ------------------------------------------------------------ 浮层
 
+    def _settings(self) -> None:
+        """设置浮层：模型 profile / 凭据 / 调度官（`settings_ui.py`）。
+
+        为什么独立成模块：home.py 只管首页那一屏，而设置的写入面（providers.toml /
+        secrets / orchestrator.toml）是另一套 machinery，混进来会长成一个文件两个主题。
+        """
+        from .settings_ui import open_settings
+        open_settings(self)
+
     def _new_app(self) -> None:
         name_field = theme.field(hint="app 目录名（英文/短横线）")
         parent_field = theme.field(value=str(Path.cwd()), hint="父目录")
@@ -616,7 +633,7 @@ class HomeWindow:
         if not running:
             self._destroy()
             return
-        text = ("社会层将**下线**；仍有 %d 个实例在跑（彼此消息不通）。\n"
+        text = ("社会层将**下线**；仍有 %d 个实例在跑。\n"
                 "停它们：`puppethub hub <父目录> down`" % running)
 
         def confirm(_event=None) -> None:

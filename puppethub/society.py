@@ -175,7 +175,7 @@ class Society:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as ex:
             self.log("warning", "SOCIETY_LEDGER",
-                     "账本 %s 读不出来（%s）——按空处理，**不覆盖它**" % (path, ex))
+                     "账本 %s 读不出来（%s）" % (path, ex))
             return {"bus_port": None, "apps": {}, "windows": {}}
         if not isinstance(data, dict):
             return {"bus_port": None, "apps": {}, "windows": {}}
@@ -304,8 +304,7 @@ class Society:
                 continue
             other = str(existing.get("root") or "")
             if other and str(Path(other).resolve()) != str(resolved):
-                return name, ("名字冲突：`%s` 已被 %s 占用——总线按 app 名寻址，"
-                              "同名会互相串线；请改目录名" % (name, other))
+                return name, ("名字冲突：`%s` 已被 %s 占用；请改目录名" % (name, other))
         return name, ""
 
     @staticmethod
@@ -339,7 +338,7 @@ class Society:
                 # 不拦（这是已定的选择），但绝不允许它是静默的。
                 self._emit(on_event, "warning",
                            "%s 正开着窗口（127.0.0.1:%s）：再拉起无头实例，这个 app 就有"
-                           "**两个写者**了（真源可能被同时改）" % (name, window["port"]))
+                           "**两个写者**了" % (name, window["port"]))
             taken = {e.get("port") for e in data["apps"].values() if e.get("port")}
             taken |= {e.get("port") for e in data["windows"].values() if e.get("port")}
             if hub_port:
@@ -362,7 +361,7 @@ class Society:
             else:
                 tail_text = " / ".join(list(tail)[-3:]) or "（子进程没有输出）"
                 self._emit(on_event, "error",
-                           "%s 等不到握手（%.0fs 超时）——条目保留（它可能只是慢）；"
+                           "%s 等不到握手（%.0fs 超时）——条目保留；"
                            "子进程输出：%s" % (name, READY_TIMEOUT, tail_text))
             started.append({"name": name, "root": str(path.resolve()), "port": port,
                             "pid": proc.pid, "ready": ready})
@@ -407,7 +406,7 @@ class Society:
                        % (item["name"], item["pid"], item["mode"]))
         for item in dead:
             self._emit(on_event, "warning",
-                       "%s 的 pid %s 已不存在（如实列出，不装作停过）"
+                       "%s 的 pid %s 已不存在"
                        % (item["name"], item["pid"]))
         return {"stopped": stopped, "dead": dead}
 
@@ -439,9 +438,8 @@ class Society:
         remote = data["apps"].get(name) or {}
         if remote.get("port") and ping(int(remote["port"]))["alive"]:
             self._emit(on_event, "warning",
-                       "%s 已经在无头运行（127.0.0.1:%s）：再开窗口就有**两个写者**了"
-                       "（真源可能被同时改）；只要一个就先 down 它"
-                       % (name, remote["port"]))
+                       "%s 已经在无头运行（127.0.0.1:%s）：再开窗口就有**两个写者**了；"
+                       "只要一个就先 down 它" % (name, remote["port"]))
         taken = {e.get("port") for e in data["apps"].values() if e.get("port")}
         taken |= {e.get("port") for e in data["windows"].values() if e.get("port")}
         if hub_port:
@@ -470,7 +468,7 @@ class Society:
         ready = self._wait_ready(listen, proc, timeout=WINDOW_READY_TIMEOUT)
         if not ready:
             self._emit(on_event, "warning",
-                       "%s 的窗口还没应答（%.0fs）——它可能还在起；等它起来就会被探到"
+                       "%s 的窗口还没应答（%.0fs）"
                        % (name, WINDOW_READY_TIMEOUT))
         return {"ok": True, "pid": proc.pid, "root": str(path), "port": listen,
                 "ready": ready}
@@ -613,7 +611,7 @@ class SocietyOps:
             return {"ok": False, "error": reply.get("error")}
         service = reply.get("service") or {}
         return {"ok": True, "name": found["name"], "hello": reply,
-                "note": "交互 %s · 借出 %s"
+                "note": "交互 %s │ 借出 %s"
                         % ("、".join(sorted(service.get("interactions") or [])) or "无",
                            "、".join(service.get("lend") or []) or "空")}
 
@@ -769,6 +767,7 @@ class SocietyOps:
         except (FileExistsError, OSError) as ex:
             return {"ok": False, "error": "创建失败：%s" % ex}
         errors = _dry_run(app.read_source())
+        recent.record(app.root)        # 新建成功即入册——首页列表的真源是 MRU
         return {"ok": not errors, "root": str(app.root),
                 "errors": [{"level": d.level, "code": d.code, "message": d.message}
                            for d in errors],

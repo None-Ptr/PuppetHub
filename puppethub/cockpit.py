@@ -4,8 +4,8 @@
 程序 / 能力）、**退回**（快照 / 回滚 / 重载）。终端形态让这三条都落在同一块
 屏上，且不需要任何装饰：
 
-    ▍ 执笔 · 共作者            0/60 · 待命        ← 签名：执笔光标
-    目标 … · 总线 … · 借出 …                       ← 运行期状态一行
+    ▍ 执笔 │ 共作者            0/60 │ 待命        ← 签名：执笔光标
+    目标 … │ 总线 … │ 借出 …                       ← 运行期状态一行
     ────────────────────────────────────────────
     12:03:41 │ › 做一个待办清单                    ← 转录：无气泡，无图标
     12:03:44 │   ‹ 好，先立窗口与清单容器：…
@@ -42,7 +42,7 @@ DEFAULT_VIEW = "观察"
 
 # 竖向预算（手册第 3 条：默认窗口内不滚动）。
 #
-# 这里踩过一次：曾经用**手算的常量**（转录 220 + 抽屉 260 + 家具）并注释"676 ≤ 692 ✓"
+# 这里踩过一次：曾经用**手算的常量**（转录 220 + 抽屉 260 + 家具）并注释"676 ≤ 692"
 # ——少算了间距与状态行，真实总和 703 > 可用 665，**抽屉底部被裁掉 38px**（截图能看见
 # 日志最后几行贴着窗口边缘断掉）。手算的预算会随子控件增删立刻失效，所以改成
 # **可计算 + 自适应**：固定开销是一个常量、剩下全部分给转录与抽屉，且**保证不溢出**。
@@ -108,7 +108,7 @@ class Cockpit:
     def _build(self) -> ft.Control:
         # ---- 执笔光标行（签名）
         self.cursor_text = mono(CURSOR_BLOCK, size=13, color=CURSOR, selectable=False)
-        self.writer_text = mono("执笔 · 未知", size=SIZE_BODY, color=TEXT,
+        self.writer_text = mono("执笔 │ 未知", size=SIZE_BODY, color=TEXT,
                                 weight=ft.FontWeight.BOLD, selectable=False)
         self.lamp_meta = mono("", size=SIZE_MICRO, color=DIM, selectable=False)
         self.prompt_row = ft.Row(spacing=6, controls=[
@@ -156,7 +156,7 @@ class Cockpit:
         self.empty_hint = ft.Container(
             visible=False,
             content=ft.Column(spacing=4, controls=[
-                mono("（还没有对话）—— 说一句话就开始；程序只由共作者改，你只需说清要什么。",
+                mono("说一句话就开始。",
                      size=SIZE_DATA, color=DIM, selectable=False),
                 ft.Row(spacing=8, wrap=True, run_spacing=4, controls=[
                     btn("› 做一个待办清单", self._example("做一个待办清单")),
@@ -223,8 +223,7 @@ class Cockpit:
                              for name in VIEWS}
         self.tab_row = ft.Row(spacing=10, controls=[
             *(self.view_buttons[name] for name in VIEWS),
-            ft.Container(expand=True),
-            mono("点当前标签收起", size=SIZE_MICRO, color=DIM, selectable=False)])
+            ft.Container(expand=True)])
         self.verify_out = mono("", size=SIZE_MICRO, color=DIM, selectable=False,
                                visible=False)
 
@@ -304,17 +303,8 @@ class Cockpit:
             ("新建 app", "生成最小骨架（CLI new）", self.tools.new_app),
         ]
         self.tools_view.controls = [
-            mono("▌ 命令行功能的图形入口（与 CLI 同一份实现）", size=SIZE_DATA,
-                 color=TEXT, selectable=False, weight=ft.FontWeight.BOLD),
-            mono("每一条都调用 CLI 用的同一份 service 函数——两套入口各写一遍语义会漂移。",
-                 size=SIZE_MICRO, color=DIM, selectable=False),
             ft.Row(spacing=10, wrap=True, run_spacing=4,
                    controls=[btn(name, handler) for name, _note, handler in rows]),
-            rule(),
-            *[ft.Row(spacing=8, vertical_alignment=ft.CrossAxisAlignment.START, controls=[
-                mono(name, size=SIZE_DATA, color=TEXT, selectable=False, width=72),
-                mono(note, size=SIZE_MICRO, color=DIM, selectable=False, expand=True),
-            ]) for name, note, _handler in rows],
         ]
 
     # ------------------------------------------------------------ 视图
@@ -386,18 +376,18 @@ class Cockpit:
         budget = ""
         if runner is not None:
             stats = runner.stats()
-            budget = "%d/%d · %s%s" % (stats["steps_last_hour"],
+            budget = "%d/%d │ %s%s" % (stats["steps_last_hour"],
                                        stats["budget_per_hour"],
                                        "运行中" if stats["busy"] else "待命",
-                                       " · 已停手" if halted else "")
+                                       " │ 已停手" if halted else "")
             self.autonomy_log.value = ("\n".join(
-                "· %s %s%s" % (item.get("time", "?")[11:],
+                "│ %s %s%s" % (item.get("time", "?")[11:],
                                (item.get("trigger") or "")[:30],
                                (" → " + "、".join(item.get("applied")[:1]))
                                if item.get("applied")
                                else (" → 被拒/跳过" if item.get("skipped") else ""))
                 for item in reversed(runner.recent(3)))) if runner.recent(3) else ""
-            self.ops_writer.value = ("自主白名单：%s（空 = 危险能力全部默认拒绝）"
+            self.ops_writer.value = ("自主白名单：%s"
                                      % ("、".join(stats["allow"]) or "空"))
         else:
             budget = "自主回路不可用"
@@ -406,7 +396,7 @@ class Cockpit:
         self.lamp_meta.value = budget
         goal = session.current_goal()
         bus = getattr(session, "bus", None)
-        self.collab_text.value = ("目标 %s · 总线 %s · 借出 %s"
+        self.collab_text.value = ("目标 %s │ 总线 %s │ 借出 %s"
                                   % (goal or "（未设）",
                                      ("127.0.0.1:%d" % bus.hub_port) if bus is not None
                                      else "未接入",
@@ -417,7 +407,7 @@ class Cockpit:
         self.dirty_banner.visible = bool(dirty)
         if dirty:
             self.dirty_banner.content.value = (
-                "! 状态标脏：%d 项写入没落盘（内存已变、磁盘未变）。重启会丢：%s"
+                "! 状态标脏：%d 项没落盘，重启会丢：%s"
                 % (len(dirty), dirty[0]))
         pending = chat.pending if chat is not None else None
         self.confirm_row.visible = bool(pending)
@@ -430,19 +420,15 @@ class Cockpit:
             self.confirm_reason.value = "待确认：%s" % pending.get("reason", "")
             self.confirm_what.value = "\n".join(shown) + more or "（空批）"
             self.confirm_reversible.value = ("涉及能力：%s" % "、".join(calls)) if calls \
-                else "涉及能力：无（纯界面改动）"
+                else "涉及能力：无"
             if pending.get("kind") == "fuse":
-                self.confirm_reversible.value = ("融合是推倒重来级的确认式变更：B 的内容全部并入、"
-                                                 "B 目录归档改名（不删除），机制体检与干跑已通过。")
-                self.confirm_undo.value = ("可逆性：可逆——执行前有兜底快照（rebuild，不参与淘汰）。"
-                                           "撤销路径：操作 » 回滚 选 rebuild 那一份。")
+                self.confirm_reversible.value = "融合：B 并入 A，B 归档改名（不删）"
+                self.confirm_undo.value = "可逆：执行前自动快照（操作 » 回滚）"
             elif pending.get("kind") == "replace":
-                self.confirm_undo.value = ("可逆性：可逆——执行前自动快照（写前存档）。"
-                                           "撤销路径：操作 » 回滚 选最近一份 auto。")
+                self.confirm_undo.value = "可逆：执行前自动快照（操作 » 回滚）"
         self.takeover_row.visible = halted or stuck
         if halted:
-            self.takeover_text.value = ("! 已停止自动重试（连续失败超过预算）。"
-                                        "解除后继续；先想清卡在哪。")
+            self.takeover_text.value = "! 已停止自动重试（连续失败超过预算）。"
         elif stuck:
             self.takeover_text.value = "△ 检测到重复失败：%s" % chat.stuck_note
 
@@ -463,16 +449,16 @@ class Cockpit:
             ("渲染", "控件%d 属性%d 动效%d 图标%d"
              % (len(rendering["controls"]), len(rendering["attributes"]),
                 len(rendering["animations"]), len(rendering["icons"]))),
-            ("geometry", "✗ 报不出（对齐无法核对；x/y 仍生效）"
-             if not rendering["geometry"] else "✓"),
-            ("snapshot", "✓" if rendering["snapshot"] else "✗"),
+            ("geometry", "报不出"
+             if not rendering["geometry"] else "正常"),
+            ("snapshot", "正常" if rendering["snapshot"] else "不支持"),
             ("链", session.plugin_chain()),
         ]
         self.spec_view.controls = [
             ft.Row(spacing=8, controls=[
                 mono(label, size=SIZE_DATA, color=DIM, selectable=False, width=80),
                 mono(value, size=SIZE_DATA,
-                     color=AMBER if (label == "geometry" and value.startswith("✗"))
+                     color=AMBER if (label == "geometry" and value == "报不出")
                      else TEXT),
             ]) for label, value in readings]
 
@@ -503,10 +489,10 @@ class Cockpit:
         writer = self.session.writer
         if writer == "llm":
             self.cursor_text.color = CURSOR
-            self.writer_text.value = "执笔 · 共作者"
+            self.writer_text.value = "执笔 │ 共作者"
         elif writer == "autonomous":
             self.cursor_text.color = GREEN
-            self.writer_text.value = "执笔 · 自主回路"
+            self.writer_text.value = "执笔 │ 自主回路"
         else:
             self.cursor_text.color = DIM
             self.writer_text.value = "无人执笔（暂停）"
@@ -544,7 +530,7 @@ class Cockpit:
     def _log_rows(self, session) -> list:
         rows = []
         for entry in list(session.log)[-200:]:
-            mark, tone = LEVEL_MARK.get(entry["level"], ("·", DIM))
+            mark, tone = LEVEL_MARK.get(entry["level"], ("│", DIM))
             where = (entry.get("where") or "").strip()
             text = entry["text"] if not where else "%s %s" % (where, entry["text"])
             rows.append(ft.Text(spans=[
@@ -749,7 +735,7 @@ class Cockpit:
             self._on_restore()
 
         self._overlay("快照", ft.Column(spacing=2, controls=[
-            mono("选中后按 [回滚] 落到那一份；回滚前会自动存档。",
+            mono("选中后按 [回滚] 落到那一份。",
                  size=SIZE_MICRO, color=DIM, selectable=False),
             *rows]), actions=[primary("回滚到选中", confirm, height=24),
                               btn("关闭", lambda _e: self._close_overlay())])

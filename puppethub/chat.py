@@ -25,6 +25,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from puppet import Diagnostic, ERROR, INFO, WARNING
 from puppet.lang import ActionStmt, CallStmt, On, parse_program
 
+from . import skills as skills_mod
+
 # 保留并注入的最近轮数：与 `context.HISTORY_K` 同值（文件与上下文必须一致）。
 HISTORY_K = 12
 
@@ -110,11 +112,23 @@ def parse_response(text: str) -> Tuple[List[Block], List[Diagnostic]]:
         elif kind == "goal":
             # `​```goal```：设定自主回路的目标（V4 C）。body 即目标文本。
             blocks.append(Block("goal", text_body, info=info))
+        elif kind == "skill":
+            # `​```skill 名字```：LLM **主动取**一份技能的全文（自选知识通道）。
+            # 取技能不是写入——它只影响后续轮次的上下文，谁当值都可以取；
+            # 名字写错会得到可见回灌（列出可用技能），绝不静默忽略。
+            raw = (arg or text_body).strip()
+            # 名字可能带着同行闭合的 ``` ——剥掉再取第一行。
+            name = raw.splitlines()[0].strip().strip("`").strip() if raw else ""
+            if not name:
+                diags.append(Diagnostic("LLM_BLOCK_UNKNOWN", WARNING,
+                                        "skill 块没有给出技能名，已忽略"))
+                continue
+            blocks.append(Block("skill", "", path=name, info=info))
         else:
             diags.append(Diagnostic("LLM_BLOCK_UNKNOWN", WARNING,
                                     "不认识的代码块 `%s`，已忽略（有效的是 puppet / "
                                     "puppet-replace / write <路径> / ask / remember / forget / "
-                                    "tell <app> <topic> / goal）" % info))
+                                    "tell <app> <topic> / goal / skill <名字>）" % info))
     return blocks, diags
 
 
@@ -194,10 +208,12 @@ class Chat:
                  on_delta: Optional[Callable[[str], None]] = None,
                  confirm: Optional[Callable[[dict], bool]] = None,
                  origin: str = "llm", fail_budget: int = FAIL_BUDGET,
-                 autonomous_allow=(), max_batch_lines: int = 0):
+                 autonomous_allow=(), max_batch_lines: int = 0,
+                 style=None):
         self.session = session
         self.provider = provider
         self.prompts = prompts                 # [(名字, 实例)]
+        self.style = style                     # style 槽位实例（block() → prompt 段）
         self.storage = storage
         self.memory = memory                   # 运行期记忆（状态，不是程序）
         self.log = log
@@ -329,13 +345,29 @@ class Chat:
                 limit = self.provider.context_limit()
             except Exception:  # noqa: BLE001
                 limit = None
-        return _context.build(
+        context = _context.build(
             app_dir=self.session.app, engine=self.session.engine,
             catalog=self.session.catalog(), diagnostics=diagnostics, turns=turns,
             rendering=self.session.hello()["rendering"], request=request,
             mode=self.mode, budget=limit, stuck=self.stuck_note,
             memory=self.memory.context_block() if self.memory is not None else "",
-            fusion_brief=self.session.fusion_brief_text())
+            fusion_brief=self.session.fusion_brief_text(),
+            skills=self.session.skills)
+        # LLM **已取**的技能全文并入（不受 select 预算限制——它主动要的必须给全）；
+        # 与自动命中去重。技能是知识：取一次、本会话持续有效。
+        taken = {s.name: s.body for s in (self.session.skills or [])
+                 if s.name in (self.session.skills_taken or set())}
+        for hit in context.get("skills") or []:
+            taken.pop(hit["name"], None)
+        for name, body in sorted(taken.items()):
+            context["skills"].append({"name": name, "text": body,
+                                      "source": "（已取，持续注入）"})
+        # 风格段：style 槽位产出的 prompt 片段（default_prompt 用 {style} 占位接住）。
+        # 契约方法 block()；插件没实现就给空——风格缺失是"难看"，不是"坏"，不拦对话。
+        style_block = getattr(self.style, "block", None)
+        context["style"] = style_block() if callable(style_block) else ""
+        context["skill_index"] = skills_mod.index_block(list(self.session.skills or []))
+        return context
 
     def _messages(self, context: dict) -> List[dict]:
         """跑 prompt 插件链。每个插件可以**完全改写**上一步的结果。"""
@@ -491,6 +523,26 @@ class Chat:
                 result.applied.append("目标已设定：%s" % block.body.strip()[:60])
             else:
                 result.skipped.append("目标写入失败")
+        for block in [b for b in blocks if b.kind == "skill"]:
+            self._take_skill(block.path, result)
+
+    def _take_skill(self, name: str, result: TurnResult) -> None:
+        """LLM 自取技能：加入会话级已取集合，之后每轮全文注入。
+
+        取一次持续有效（技能是知识，不是动作）；重复取是良性操作，如实说即可；
+        名字不存在 → skipped（回灌给 LLM，列出可用技能）。
+        """
+        taken = self.session.skills_taken
+        if name in taken:
+            result.applied.append("技能 %s 已在用：全文持续注入中，不必重复取" % name)
+            return
+        skill = skills_mod.find(self.session.skills, name)
+        if skill is None:
+            available = "、".join(s.name for s in self.session.skills) or "（无）"
+            result.skipped.append("没有叫 %r 的技能；可用：%s" % (name, available))
+            return
+        taken.add(name)
+        result.applied.append("已取技能 %s——全文将从下一轮起持续注入" % name)
 
     # ------------------------------------------------------------ 运行期记忆
 

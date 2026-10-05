@@ -195,9 +195,27 @@ def main() -> int:
           result["ok"] and after_clear == {} and before_clear != {}, str(after_clear))
     check("清空有回执（不是静默）",
           any("已删除" in note for note in result["notes"]), str(result["notes"])[:120])
-    check("生效值回落到默认（不是残留旧值）",
-          session.llm_settings()["base_url"] == "https://api.openai.com/v1",
-          str(session.llm_settings()))
+    # 这一条要验的是"**不是残留 app 的旧值**"。两层前提说清：
+    # ① `reload_plugins` 有护栏（流式中 / 有待确认动作时**拒绝**重载——丢了 pending
+    #    就像"确认过了"），所以要在**重新装载**上看，而不是在可能被挡住的这一次上；
+    # ② 本机若只有**一个** profile，app 没配时按既有规则会兜底用上它——那是对的，
+    #    但会盖住"是否残留"这件事。所以把 profile 与总线都临时清掉再看回落。
+    from puppethub import secrets as _secrets
+    from puppethub.orchestrator import config_path as _orch_path
+    from puppethub.session import Session as _Session
+    _prov, _orch = _secrets.providers_path(), _orch_path()
+    _saved = {}
+    for _p in (_prov, _orch):
+        if _p.exists():
+            _saved[_p] = _p.read_text(encoding="utf-8")
+            _p.unlink()
+    reopened = _Session(app)
+    reopened.start()
+    check("本机 profile 与总线都没有时 → 生效值回落到默认（不是残留旧值）",
+          reopened.llm_settings()["base_url"] == "https://api.openai.com/v1"
+          and reopened.llm_settings()["model"] == "", str(reopened.llm_settings()))
+    for _p, _text in _saved.items():
+        _p.write_text(_text, encoding="utf-8")
 
     print("\n3) 人的写入（GUI 动作）：干跑拦住坏程序，拒稿留底且真源恢复")
     before = app.read_source()
@@ -356,8 +374,9 @@ def main() -> int:
               result["ok"] and os.environ.get("GUI_ENV_KEY") == "sk-env-000111", str(result))
         check("持久化被调用（新进程也能用）",
               ("GUI_ENV_KEY", "sk-env-000111") in persisted, str(persisted))
-        check("回执说清代价（同用户所有进程可见 / env 第一优先）",
-              any("每个进程" in note and "盖过" in note for note in result["notes"]),
+        check("回执是数据不是解说（文案纪律：界面字只留数据与可执行诊断）",
+              any("GUI_ENV_KEY" in note for note in result["notes"])
+              and not any("每个进程" in note for note in result["notes"]),
               str(result["notes"])[:160])
         sec.store_set("GUI_ENV_KEY", "sk-keystore-222333")
         value, source = sec.resolve("GUI_ENV_KEY")

@@ -157,6 +157,33 @@ def main() -> int:
         '[fake]\nbase_url = "%s"\nmodel = "fake-model"\nkey_env = "SMOKE_KEY"\n' % base,
         encoding="utf-8")
 
+    print("\n3b) 总线兜底：app 没配模型 → 用社会层（调度官）那套")
+    (home / "orchestrator.toml").write_text(
+        '[plugins.openai-compat]\nbase_url = "%s"\nmodel = "bus-model"\n'
+        'key_env = "SMOKE_KEY"\n' % base, encoding="utf-8")
+    bare_app = create_app(work, "bareapp", "没配模型的 app")
+    bare_app.write_source(list(PROGRAM))
+    bare_app.config_path.write_text('llm_provider = "openai-compat"\nstorage = "file"\n',
+                                    encoding="utf-8")
+    bare = Session(bare_app)
+    bare.start()
+    check("app 没配 → 回退到总线那套",
+          bare.llm_settings()["model"] == "bus-model"
+          and bare.llm_settings()["base_url"] == base, str(bare.llm_settings()))
+    check("回退**留痕**（降级不许静默）",
+          any("LLM_FALLBACK" == e["code"] for e in bare.log), str(list(bare.log)[-1:]))
+    bare_app.config_path.write_text(
+        'llm_provider = "openai-compat"\nstorage = "file"\n\n'
+        '[plugins.openai-compat]\nmodel = "own-model"\n', encoding="utf-8")
+    own = Session(bare_app)
+    own.start()
+    check("app 自己配了就不回退（显式键优先）",
+          own.llm_settings()["model"] == "own-model", str(own.llm_settings()))
+    check("自己配了就**没有**回退痕迹",
+          not any("LLM_FALLBACK" == e["code"] for e in own.log),
+          str(list(own.log)[-1:]))
+    (home / "orchestrator.toml").unlink()   # 清掉这一节造的社会层配置，别污染后面的节
+
     print("\n4) 探活：六种失败分开说清（本机假服务端）")
     _Behaviour.models_status = 200
     result = keymod.probe({"base_url": base, "model": "fake-model", "key_env": "SMOKE_KEY"})

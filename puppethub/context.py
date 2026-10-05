@@ -1,7 +1,7 @@
 """基础上下文块：内核只提供原料，**组装交给 prompt 插件**。
 
-- **每轮固定**：真源全文 · 最近 K 轮对话 · 能力目录紧凑签名 · 本轮诊断摘要 ·
-  词汇边界（渲染器自述）· `DESIGN.md` · 资产清单。
+- **每轮固定**：真源全文 │ 最近 K 轮对话 │ 能力目录紧凑签名 │ 本轮诊断摘要 │
+  词汇边界（渲染器自述）│ `DESIGN.md` │ 资产清单。
 - **按需**：按**本轮触碰的词汇**检索的规范章节（关键词映射表，**不引向量库**）。
 - **超限**：分级注入 + **显式声明省略**，绝不静默截断。
 
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Dict, List, Optional
 
 from puppet import spec_dir, vocab
@@ -26,7 +27,9 @@ HISTORY_K = 12
 
 # 分级省略的顺序（从最可省到最不可省）。真源不在其中。
 # 记忆排在 design 之前：设计文档是**意图的唯一载体**，而记忆是可丢的状态。
-_DROP_ORDER = ("spec", "assets", "memory", "design", "turns")
+# skills 比 spec 后省：触发词是显式命中的（请求/源里真出现了），比按词汇
+# 计分的规范章节更准——都是可再生知识，但省的时候先舍"可能不相关"的。
+_DROP_ORDER = ("spec", "skills", "assets", "memory", "design", "turns")
 
 DESIGN_HEAD_CHARS = 1200
 SPEC_SECTION_LIMIT = 3
@@ -62,6 +65,52 @@ def touched_tokens(engine, diagnostics) -> List[str]:
         if name + "(" in source:
             tokens.add(name)
     return sorted(token for token in tokens if token and len(str(token)) >= 3)
+
+
+def capability_docs(catalog: List[dict], source: str, request: str) -> Dict[str, str]:
+    """触碰的能力 → **docstring 全文**（能力文档的"按需"层）。
+
+    签名 + 说明首行常驻（"有什么"必须每轮可见）；正文（参数语义 / 返回 / 示例）
+    只在触碰时注入：程序正在调用它（`name(` 出现在源里），或请求文本点名它。
+    触发前 LLM 调错参数只能靠 `CALL_CONTRACT` 诊断试错——按需注入让它第一次就读对。
+    只收**多行**文档：单行说明已在常驻清单里，注入全文没有增量。
+    """
+    req = str(request or "")
+    out: Dict[str, str] = {}
+    for entry in catalog or []:
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        # 触碰 = 源里作为**词**出现（`call send_mail with …` 名后是空格，
+        # `name + "("` 只盖得住表达式里的调用——所以用词边界正则），
+        # 或请求文本点名了它。
+        touched = (re.search(r"\b%s\b" % re.escape(name), source) is not None
+                   or re.search(r"\b%s\b" % re.escape(name), req) is not None)
+        if not touched:
+            continue
+        doc = (entry.get("doc") or "").strip()
+        if doc and len(doc.splitlines()) > 1:
+            out[name] = doc
+    return out
+
+
+def request_tokens(request: str) -> List[str]:
+    """本轮**请求文本**的 2/3 字滑窗——任务词的检索源。
+
+    配方库（`spec/07-recipes.md`）按"用户想做什么"命中：程序里还没有
+    `remove_where` 时，用户说"删除这条记录"，"删除"这个 2-gram 就能命中
+    配方章节——**第一次就写对**的引导靠它，而不只是写错后靠诊断回灌纠正。
+    2-gram 噪音不小，但检索是计分排序 + 节数/字符双上限，噪音顶多稀释、
+    不会挤掉高分章节。
+    """
+    text = re.sub(r"\s+", " ", str(request or "")).strip()
+    if not text:
+        return []
+    grams: set = set()
+    for size in (2, 3):
+        for i in range(len(text) - size + 1):
+            grams.add(text[i:i + size])
+    return sorted(grams)
 
 
 # ------------------------------------------------------------------ 规范片段
@@ -109,7 +158,7 @@ def _spec_index() -> Dict[str, list]:
 
 
 def _path_of(filename: str, stack: List[str]) -> str:
-    return " · ".join([filename] + stack) if stack else filename
+    return " │ ".join([filename] + stack) if stack else filename
 
 
 def spec_sections(tokens: List[str], limit: int = SPEC_SECTION_LIMIT) -> List[dict]:
@@ -142,18 +191,25 @@ def spec_sections(tokens: List[str], limit: int = SPEC_SECTION_LIMIT) -> List[di
 def build(*, app_dir, engine, catalog: List[dict], diagnostics: List[dict],
           turns: List[dict], rendering: dict, request: str, mode: str,
           budget: Optional[int] = None, stuck: str = "", memory: str = "",
-          fusion_brief: str = "") -> dict:
+          fusion_brief: str = "", skills: list = ()) -> dict:
     """产出基础上下文块。`turns` 是**已经截到 K 轮**的历史。"""
     source = "\n".join(engine.program_lines())
     design = app_dir.read_design()
     assets = _assets(app_dir)
-    tokens = touched_tokens(engine, diagnostics)
+    # 检索源 = 程序触碰的词汇 + 请求文本的任务词（后者让"第一次就写对"成为可能：
+    # 程序里还没有 remove_where 时，"删除这条记录"就能命中配方章节）。
+    tokens = touched_tokens(engine, diagnostics) + request_tokens(request)
     sections = spec_sections(tokens)
+    # Skill（.md 文件）：显式触发词命中才注入——机制见 skills.select。
+    from . import skills as _skills
+    skill_hits = _skills.select(list(skills or []), request, source)
 
     context = {
         "mode": mode,
         "app_name": app_dir.name,
         "source": source,
+        # 触碰能力的 docstring 全文（"有什么"常驻、"怎么用对"按需——见 capability_docs）。
+        "capability_docs": capability_docs(catalog, source, request),
         "design": design[:DESIGN_HEAD_CHARS] if len(design) > DESIGN_HEAD_CHARS else design,
         "catalog": catalog,
         "vocabulary": {
@@ -178,6 +234,7 @@ def build(*, app_dir, engine, catalog: List[dict], diagnostics: List[dict],
         "memory": memory,
         "fusion_brief": fusion_brief,
         "spec": sections,
+        "skills": skill_hits,
         "touched": tokens,
         "request": request,
         "stuck": stuck,
@@ -225,6 +282,11 @@ def _fit(context: dict, budget: int) -> None:
             context["omitted"].append("规范片段 %d 节（按词汇检索所得，本轮到上限被省略）"
                                       % len(context["spec"]))
             context["spec"] = []
+        elif layer == "skills" and context.get("skills"):
+            context["omitted"].append("技能 %d 份（%s；本轮到上限被省略）"
+                                      % (len(context["skills"]),
+                                         "、".join(s["name"] for s in context["skills"])))
+            context["skills"] = []
         elif layer == "assets" and context.get("assets"):
             context["omitted"].append("assets/ 清单 %d 项" % len(context["assets"]))
             context["assets"] = []

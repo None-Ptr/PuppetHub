@@ -98,6 +98,7 @@ def main(page: ft.Page):
             banner.content.value = "；".join("%s %s" % (code, msg)
                                              for code, msg in notes[:3])
         page.update()
+        renderer.restore_focus()
 
     def on_event(node_id, event, row, value):
         for d in engine.fire(node_id, event, row, value):

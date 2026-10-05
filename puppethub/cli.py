@@ -81,13 +81,13 @@ def cmd_home(args) -> int:
         if not error:
             provider, error = build_provider(model["options"], log=_log_line)
         if model["note"]:
-            print("  · %s" % model["note"], file=sys.stderr)
+            print("  │ %s" % model["note"], file=sys.stderr)
         if error:
             # **降级必须可见**：没有调度官，但社会台照常。
             print("调度官不可用（社会台照常）：\n%s" % error, file=sys.stderr)
         orchestrator = Orchestrator(ops, log=_log_line, provider=provider,
                                     provider_error=error or "")
-    print("首页：社会层宿主在本进程（总线在进程内；关首页 = 社会层下线）",
+    print("首页：社会层宿主在本进程",
           file=sys.stderr)
     HomeWindow(society, ops, orchestrator).run()
     return 0
@@ -101,6 +101,8 @@ def cmd_new(args) -> int:
         print("创建失败：%s" % ex, file=sys.stderr)
         return 1
     diags = _validate_file(app.source_path)
+    from . import recent
+    recent.record(app.root)            # 新建成功即入册——首页列表的真源是 MRU
     if args.json:
         print(json.dumps({"ok": not any(d.level == "error" for d in diags),
                           "app": str(app.root),
@@ -108,7 +110,7 @@ def cmd_new(args) -> int:
                          ensure_ascii=False))
     else:
         print("已创建 app：%s" % app.root)
-        print("骨架：window + navbar + 内容容器（不含业务——意图写进 DESIGN.md）")
+        print("骨架：window + navbar + 内容容器")
         print("静态校验：")
         _print_diags(diags, False)
         print("下一步：puppethub run %s" % app.root)
@@ -187,7 +189,7 @@ def cmd_repl(args) -> int:
         return 1
     diags = session.start()
     _print_diags(diags, False)
-    print("REPL：输入命令批（可多行，空行结束一批）；q 退出。写者=你（origin=driver）。")
+    print("REPL：输入命令批（可多行，空行结束一批）；q 退出。")
 
     def flush(pending: list) -> list:
         """把攒住的行作为一批应用。**退出前也必须应用**——人输入过的东西
@@ -275,7 +277,7 @@ def cmd_keys(args) -> int:
             print("  " + line)
         if session:
             print("  （本 app 需要：%s）" % "、".join(names))
-        print("  钥匙串：%s（在 app 目录之外，分享 app 不会带上它）"
+        print("  钥匙串：%s"
               % _keys.secrets.secrets_path())
         return 0
 
@@ -360,7 +362,7 @@ def cmd_fuse(args) -> int:
         print("  体检拒绝：%s" % error, file=sys.stderr)
     if not report["ok"]:
         return 1
-    print("=== 审计通过（干跑在执行路径上仍会再拦一道） ===")
+    print("=== 审计通过 ===")
     if not args.yes:
         print("dry-run：以上是融合方案。确认无误加 --yes 执行。")
         return 0
@@ -416,10 +418,10 @@ def cmd_edit(args) -> int:
                       file=sys.stderr)
             return 1
         _print_diags(result["diagnostics"], False)
-        print("已应用并重载（写前有兜底快照，可回滚）。")
+        print("已应用并重载（可回滚）。")
         return 0
     print("已取消：文件保持你编辑后的样子，但程序未采用它"
-          "（下次打开编辑器仍在；真源以程序面板为准）。")
+          "")
     return 0
 
 
@@ -442,7 +444,7 @@ def cmd_build(args) -> int:
         return 1
     print("已生成独立 flet 工程：%s" % result["out_dir"])
     for rel in result["files"]:
-        print("  · %s" % rel)
+        print("  │ %s" % rel)
     for note in result.get("notes") or []:
         print("  ⚠ %s" % note)
     print("手机上没有写者：改程序回桌面改 app.puppet 重新 build。")
@@ -453,7 +455,7 @@ def cmd_build(args) -> int:
         if not outcome["ok"]:
             print(outcome.get("error") or "flet build 失败", file=sys.stderr)
             return 1
-        print("构建完成（产物见 flet build 输出）。")
+        print("构建完成。")
     else:
         print("构建：cd \"%s\" && flet build %s（或加 --run-flet-build 让本命令代跑；"
               "需要 flet CLI 与 Android SDK）" % (result["out_dir"], args.target))
@@ -461,7 +463,7 @@ def cmd_build(args) -> int:
 
 
 def main(argv=None) -> int:
-    # GBK 控制台兜底：⚠/· 这类装饰符 GBK 编不了会让整个命令炸掉——
+    # GBK 控制台兜底：⚠/│ 这类装饰符 GBK 编不了会让整个命令炸掉——
     # 编不了的字符替换成 ? ，信息主体（中文）不受影响。绝不静默，但也不炸。
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):

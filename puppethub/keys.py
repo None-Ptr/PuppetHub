@@ -60,22 +60,14 @@ def set_secret(name: str, value: str, target: str = "keystore") -> dict:
     """
     if target == "env":
         result = secrets.set_env(name, value)
-        note = result.get("note") or ""
-        if result.get("ok"):
-            note += "（%s）" % _env_shadow_hint(name)
-        return {"target": "env", "note": note, "ok": bool(result.get("ok")),
-                "error": result.get("error")}
+        return {"target": "env", "note": result.get("note") or "已写入环境变量 %s" % name,
+                "ok": bool(result.get("ok")), "error": result.get("error")}
     path = secrets.store_set(name, value)
-    note = "已写入钥匙串 %s（0600；app 目录之外——分享 app 不会带上它）" % path.name
+    note = "已写入钥匙串 %s" % path.name
     shadow = secrets.env_shadow_note(name, secrets.resolve(name)[1])
     if shadow:
         note += "\n" + shadow
     return {"target": "keystore", "path": path, "note": note, "ok": True, "error": None}
-
-
-def _env_shadow_hint(name: str) -> str:
-    return ("环境变量对以你身份运行的**每个进程**可见，也会被所有子进程继承"
-            "（比钥匙串差）；它是第一优先，会盖过钥匙串里的同名值")
 
 
 def clear_secret(name: str, target: str = "env") -> dict:
@@ -316,9 +308,27 @@ def provider_view(app_dir, app_config_path=None) -> dict:
                  "model": options.get("model") or (table or {}).get("model"),
                  "key_env": options.get("key_env") or (table or {}).get("key_env")
                  or "OPENAI_API_KEY"}
+    # 总线（社会层/调度官）兜底的**只读信息**：`effective` 只反映"这个 app 配了什么"
+    # （配置视角），不把继承来的值并进来——否则用户**主动清空**配置后又被兜底补回
+    # 旧值，等于违背了他的意图（实测就是这么坏的：清空后 effective 还留着旧 model）。
+    # 运行时会不会用总线那套，由 `Session._fallback_llm_from_bus` 决定并留痕；
+    # 这里只把它**说出来**，供界面提示。
+    fallback: dict = {}
+    if not effective.get("model"):
+        try:
+            from .orchestrator import resolve_model
+            got = resolve_model()
+        except Exception as ex:          # 社会层配置坏掉也要如实显示，不当作没有
+            got = {"error": "社会层配置读不出来（%s: %s）" % (type(ex).__name__, ex)}
+        bus = got.get("options") or {}
+        if not got.get("error") and bus.get("model"):
+            fallback = {"base_url": bus.get("base_url"), "model": bus.get("model"),
+                        "key_env": bus.get("key_env") or "OPENAI_API_KEY",
+                        "profile": got.get("profile") or "",
+                        "note": got.get("note") or ""}
     return {"profile": name, "profile_found": bool(table) if name else None,
             "app_options": options, "profile_options": dict(table or {}),
-            "effective": effective,
+            "effective": effective, "fallback": fallback or None,
             "profiles": sorted(secrets.profiles()), "home": str(secrets.home_dir())}
 
 
@@ -353,8 +363,7 @@ def apply_provider_settings(app_config_path, scope: str = "profile",
         wrote.append(str(app_config_path))
         # 留着 `[llm] profile` 会让人以为端点在 profile 里：选"仅本 app"就把它撤掉。
         set_options(Path(app_config_path), "llm", {"profile": None})
-        notes.append("端点写进了 app 配置：这份 app 分享给别人时会带上端点"
-                     "（凭据仍是变量名，不会带上）")
+        notes.append("端点写进了 app 配置")
     else:
         if not profile_name:
             return {"ok": False, "wrote": [], "notes": [],
@@ -363,10 +372,9 @@ def apply_provider_settings(app_config_path, scope: str = "profile",
         wrote.append(str(secrets.providers_path()))
         set_options(Path(app_config_path), "llm", {"profile": profile_name})
         wrote.append(str(app_config_path))
-        notes.append("app 里只留了 profile 名（%s）：端点与凭据名留在本机 %s"
-                     % (profile_name, secrets.providers_path()))
+        notes.append("app 里只留了 profile 名 %s" % profile_name)
     for key in (clear or []):
-        notes.append("已删除 %s（回到上一层或默认值）" % key)
+        notes.append("已删除 %s" % key)
     if api_key:
         name = key_env or str((provider_view(app_config_path)["effective"] or {}).get("key_env")
                               or "OPENAI_API_KEY")

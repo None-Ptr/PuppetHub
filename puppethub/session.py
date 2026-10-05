@@ -72,7 +72,13 @@ class Session:
     `system`（快照回滚、重置等预定义动作）/ `user`（人在界面里的交互，不是改程序）。
     """
 
+    # Skill（.md）在装配时赋值；类级兜底让"装配提前失败"的实例也不会缺属性。
+    skills: list = []
+    # LLM 经 ```skill 名字``` 块自取的技能名（会话级：取一次、持续注入全文）。
+    skills_taken: set = set()
+
     def __init__(self, app: AppDir, on_change: Optional[Callable[[], None]] = None):
+        self.skills_taken: set = set()         # LLM 经 skill 块自取的技能（会话级）
         self.spec_version = check_spec_version()
         self.spec_dir = check_data_files()     # 分发定稿：数据文件缺失在启动时可见，而非晚炸
         self.app = app
@@ -127,7 +133,7 @@ class Session:
         self._rebuild_catalog()
         self._absorb_diags(diags, "装载")
         self._note("SESSION", "信息",
-                   "已装载 %s（语言 %s）· %d 个节点 · %d 项能力"
+                   "已装载 %s（语言 %s）│ %d 个节点 │ %d 项能力"
                    % (self.app.name, self.spec_version,
                       len(self.engine.program.nodes), len(self._catalog)))
         return diags
@@ -163,6 +169,7 @@ class Session:
             self.plugin_error = str(ex)
             self.config = {}
         self._apply_llm_profile()
+        self._fallback_llm_from_bus()
         self.registry = build_registry(include_user=False)
         # 插件目录两处：app 自带（.puppethub/plugins/，随 app 走）+ 用户全局。
         # app 级目录让"这个 app 需要的插件"和 app 一起搬——融合/拷贝时不会掉件。
@@ -172,6 +179,11 @@ class Session:
         self.service_lend = list((self.config.get("service") or {}).get("lend") or [])
         slots, names, diags = select_slots(self.registry, self.config, log=self._plugin_log)
         for diag in list(self.registry.diagnostics) + list(diags):
+            self.note(diag.level, diag.code, diag.message)
+        # Skill（.md 文件）：内置配方 + app 级 + 用户级，放文件即生效。
+        from . import skills as _skills
+        self.skills, skill_diags = _skills.load(str(self.app.root), log=self._plugin_log)
+        for diag in skill_diags:
             self.note(diag.level, diag.code, diag.message)
         storage_plugin = slots.get("storage")
         if storage_plugin is None:
@@ -204,7 +216,8 @@ class Session:
         self.chat = Chat(self, provider=slots.get("llm_provider"),
                          prompts=slots.get("prompt") or [], storage=self.storage,
                          memory=self.memory, log=self.note,
-                         on_delta=lambda piece: self._delta(piece))
+                         on_delta=lambda piece: self._delta(piece),
+                         style=slots.get("style"))
         self.chat.mode = "执行"
         # **自主回路（V2 核心）**：与共作者共用 provider（加锁串行）、共用同一条写入路径；
         # 但过程账分文件、预算更紧、危险动作默认拒绝。它是否当值由写者状态机决定。
@@ -214,7 +227,8 @@ class Session:
                 self, provider=slots.get("llm_provider"),
                 prompts=slots.get("prompt") or [], storage=self.storage,
                 memory=self.memory, log=self.note,
-                on_delta=lambda piece: self._delta(piece))
+                on_delta=lambda piece: self._delta(piece),
+                style=slots.get("style"))
         self.writer = "llm" if self.chat is not None else "none"
         self._cap_stamp = self._cap_mtime()
 
@@ -232,9 +246,10 @@ class Session:
         provider = self.slots.get("llm_provider")
         describe = getattr(provider, "describe", None)
         prompts = "、".join(self.slot_names.get("prompt") or []) or "（无）"
-        return "provider=%s · storage=%s · prompt=%s" % (
+        style = self.slot_names.get("style") or "无"
+        return "provider=%s │ storage=%s │ prompt=%s │ style=%s" % (
             describe() if callable(describe) else (self.slot_names.get("llm_provider") or "无"),
-            self.slot_names.get("storage") or "无", prompts)
+            self.slot_names.get("storage") or "无", prompts, style)
 
     def chat_turn(self, text: str):
         """与 LLM 的一轮。**这是唯一能让程序改变的入口**（人只能通过对话表达写入意图）。"""
@@ -378,6 +393,16 @@ class Session:
         self.plugin_error = ""
         self.slots = {}
         self.slot_names = {}
+        # **配置必须现读**：设置面板保存的就是这个文件，而"插件已热重载：配置即时生效"
+        # 这句承诺的前提是装配前重新读盘——否则改完配置文件、装进槽位的还是旧副本
+        # （实测：清空模型配置后 `llm_settings()` 仍返回旧值 = 一处静默失败）。
+        try:
+            self.config = self.app.read_config()
+        except ConfigError as ex:
+            self._note("CONFIG", "错误", str(ex))
+            self.plugin_error = str(ex)
+        self._apply_llm_profile()
+        self._fallback_llm_from_bus()
         self._build_plugins()
         if previous_writer == "llm" and self.chat is not None:
             self.writer = "llm"
@@ -481,6 +506,48 @@ class Session:
         self.note("info", "LLM_PROFILE",
                   "profile %s → %s（来自 %s；app 里的显式键优先）"
                   % (name, "、".join(added) or "（无需补）", secrets.providers_path()))
+
+    def _fallback_llm_from_bus(self) -> None:
+        """**第三层兜底：用总线（社会层/调度官）那套 API**。
+
+        解析顺序（从具体到宽，只补缺省、app 的显式键永远优先）：
+        app `[plugins.openai-compat]` → app `[llm] profile` → **社会层
+        `$PUPPETHUB_HOME/orchestrator.toml`**（= 首页调度官正在用的那套；
+        它内部还含"唯一 profile 自动用"）。
+
+        两个纪律：
+        - **复用 `orchestrator.resolve_model()`，不另写一份解析**——两套解析迟早漂移；
+        - **只补内存、不写盘**（app 因此仍然可以安全分享），且**留痕**
+          （回退是降级，必须可见，不能让人以为自己配过）。
+        """
+        options = ((self.config.get("plugins") or {}).get("openai-compat") or {})
+        if options.get("model"):          # app 自己配了 → 不回退
+            return
+        try:
+            from .orchestrator import resolve_model
+            resolved = resolve_model()
+        except Exception as ex:           # 社会层配置坏掉也要说出来，不静默
+            self.note("error", "LLM_FALLBACK",
+                      "社会层配置读不出来（%s: %s）" % (type(ex).__name__, ex))
+            return
+        bus = resolved.get("options") or {}
+        if resolved.get("error") or not bus.get("model"):
+            return                        # 总线也没有 → 保持既有"未配置"报错，不替它说话
+        plugins = self.config.setdefault("plugins", {})
+        target = plugins.setdefault("openai-compat", {})
+        if not isinstance(target, dict):
+            return
+        added = []
+        for key in ("base_url", "model", "key_env", "temperature",
+                    "context_limit", "timeout"):
+            if key in bus and key not in target:
+                target[key] = bus[key]
+                added.append(key)
+        note = str(resolved.get("note") or "").strip()
+        self.note("info", "LLM_FALLBACK",
+                  "本 app 没配模型 → 用总线那套（%s @ %s；补进 %s）%s"
+                  % (bus.get("model"), bus.get("base_url"),
+                     "、".join(added) or "（无需补）", ("——" + note) if note else ""))
 
     def credential_names(self) -> list:
         """本 app 需要的凭据变量名（当前 llm provider 的 `key_env`）。"""

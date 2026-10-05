@@ -98,9 +98,9 @@ def brief_text(b: AppDir) -> str:
     if info["diags"]:
         return ("（B 当前有未通过静态校验的问题，先修 B 再融合：%s）"
                 % json.dumps(info["diags"], ensure_ascii=False)[:400])
-    lines = ["- 地址清单（id · 类型 · 父 · 属性名%s）" % (" · title" if info["window_count"] else "")]
+    lines = ["- 地址清单（id │ 类型 │ 父 │ 属性名%s）" % (" │ title" if info["window_count"] else "")]
     for node in info["nodes"]:
-        line = "  · #%-14s %-10s parent=#%s attrs=%s" % (
+        line = "  │ #%-14s %-10s parent=#%s attrs=%s" % (
             node["id"], node["type"], node["parent"], ",".join(node["attrs"]))
         if node.get("title") is not None:
             line += "  title=%r" % node["title"]
@@ -108,7 +108,7 @@ def brief_text(b: AppDir) -> str:
     lines.append("- 数据源：%s" % ("、".join("#" + d for d in info["data"]) or "（无）"))
     lines.append("- 能力：")
     for cap in info["caps"]:
-        lines.append("  · %s  # %s" % (cap["name"], cap["doc"]))
+        lines.append("  │ %s  # %s" % (cap["name"], cap["doc"]))
     lines.append("- 契约：依赖〔%s〕非目标〔%s〕已知限制〔%s〕"
                  % (info["contract"]["依赖"], info["contract"]["非目标"],
                     info["contract"]["已知限制"]))
@@ -177,8 +177,8 @@ _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def audit_plan(a: AppDir, b: AppDir, plan: dict) -> dict:
     """对**任何来源**的 plan 做同一套体检。冲突/不合法只停下并列清单。
 
-    拒绝清单（grilling 共识）：路径合法 · B 未在运行 · 改名**级联合法**（最终映射
-    重查撞名）· caps 动作合法 · 干跑（在 `fuse` 里，落在确认之后执行之前）。
+    拒绝清单（grilling 共识）：路径合法 │ B 未在运行 │ 改名**级联合法**（最终映射
+    重查撞名）│ caps 动作合法 │ 干跑（在 `fuse` 里，落在确认之后执行之前）。
     品味字段（intent / window_title）机制不打分——那是确认卡上人拍板的事。
     """
     a_program, a_diags = parse_side(a)

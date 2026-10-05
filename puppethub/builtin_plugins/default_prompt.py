@@ -80,7 +80,12 @@ SYSTEM = """你是这个 app 的**共作者**。人用自然语言说要什么�
    ```goal
    让"完成率"卡片始终反映当天数据；发现数据源断更就先修复数据源。
    ```
-9. 其它文字 = 说明。**没有指令块就等于本轮什么都不改**，所以别把代码写在说明里。
+9. **取技能**（自选知识）：需要某种写法（删数据 / 求和 / 调能力…）时，输出
+   ```skill 名字``` 块——名字见上方【可用技能】索引。取一次全文持续注入，别重复取；
+   不确定就用，比猜着写再修便宜。
+10. 其它文字 = 说明。**没有指令块就等于本轮什么都不改**，所以别把代码写在说明里。
+
+{skill_index}
 
 ## 语言速查
 
@@ -90,7 +95,15 @@ SYSTEM = """你是这个 app 的**共作者**。人用自然语言说要什么�
 - 状态标志（可读可写）：`hover focus pressed error visible disabled`。
 - 表达式只出现在属性值 / `when` / 动作参数 / `data` 初值里；引用是 `#id.attr`，模板行内用绑定名（如 `t.text`）。
 - 模板：`add #root template #tpl as t` + 在模板内写行内容，再用 `add #lst list #L source=#tpl_data template=#tpl` 使用它。
-- 消息：`#id.value`（输入/选择/进度）· `#id.selected`（下拉/分页）· `#slot.status` / `#slot.value`（能力槽）· `count(#data)`。
+- 消息：`#id.value`（输入/选择/进度；**用户操作给出的值先进状态**——`change`/`submit` 处理器里直接读）·
+  `#id.selected`（下拉/分页的**序号**，从 0 起；要选中的文本读 `value`）·
+  `#slot.status` / `#slot.value`（能力槽，值类属性可直接绑定它）·
+  `count(#data)` · **`sum(#data, "字段")`（合计，活绑定自动重算）**。
+- 三个高频坑：**删/改一条数据**用 `remove_where`/`update_where`（`del` 只删节点）；
+  **求和/比较**先 `num(...)` 转换（`+` 有一侧是字符串就是拼接，静默）；
+  **行内事件**必须 `as t` 拿行上下文。详细配方（含完整写法）按本轮任务在下方"规范片段"里按需注入。
+
+{style}
 
 ## 观测能力（渲染器自述——**诚实降级必须让你看见**）
 
@@ -123,6 +136,11 @@ class DefaultPrompt:
                 ("{attributes}", "、".join(vocabulary.get("attributes") or [])),
                 ("{animations}", "、".join(vocabulary.get("animations") or [])),
                 ("{icons}", "、".join(vocabulary.get("icons") or [])),
+                # 技能索引：常驻的"知识面"清单——LLM 据此决定自取哪份技能全文。
+                ("{skill_index}", str(context.get("skill_index") or "")),
+                # 风格段来自 style 槽位（宿主放进 context["style"]）：每轮常驻同一套，
+                # 风格的一致性靠"常驻"而不是按需——按需会让它这轮守纪律下轮忘。
+                ("{style}", str(context.get("style") or "")),
                 ("{observation}", self._observation_block(context.get("observation")))):
             system = system.replace(token, value)
         messages = []
@@ -152,10 +170,18 @@ class DefaultPrompt:
                           "摘要是清单级——不含属性值全文，方案字段不依赖它们）】\n%s"
                           % context["fusion_brief"])
         blocks.append("【本 app 的能力】\n" + self._catalog_block(context.get("catalog")))
+        docs = context.get("capability_docs") or {}
+        if docs:
+            # 能力文档的按需层：只给"本轮触碰的"（程序正在调用 / 请求点名）。
+            blocks.append("【触碰能力的完整说明（调它们之前先读）】\n"
+                          + "\n\n".join("◆ %s\n%s" % (name, text)
+                                        for name, text in sorted(docs.items())))
         blocks.append("【assets/ 里可用的文件】\n" + self._assets_block(context.get("assets")))
         diagnostics = context.get("diagnostics") or []
         if diagnostics:
             blocks.append("【上一轮以来的诊断（先修这些）】\n" + self._diag_block(diagnostics))
+        for skill in context.get("skills") or []:
+            blocks.append("【技能 · %s】\n%s" % (skill["name"], skill["text"]))
         for section in context.get("spec") or []:
             blocks.append("【规范片段 · %s】\n%s" % (section["title"], section["text"]))
         if context.get("stuck"):
@@ -193,7 +219,12 @@ class DefaultPrompt:
     @staticmethod
     def _catalog_block(catalog) -> str:
         if not catalog:
-            return "（还没有任何能力；需要外部数据或副作用时，用 write 块加一个）"
+            return ("（还没有任何能力。需要外部数据或副作用时用 write 块写 capabilities.py："
+                    "`@capability(returns=…)` + **非空 docstring** + 参数类型注解；"
+                    "调用 `call 名字 with {…} into #槽`，界面绑定 `#槽.value`，"
+                    "失败路径要有人接（on #槽 error）。"
+                    "**纯计算不需要能力**——计数 `count(#data)`、合计 `sum(#data, \"字段\")`、"
+                    "取项 at/first/last 都是内建且是活绑定；任务相关时会注入完整技能。）")
         lines = []
         for item in catalog:
             doc = (item.get("doc") or "").splitlines()

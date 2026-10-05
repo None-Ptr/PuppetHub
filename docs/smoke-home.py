@@ -9,7 +9,9 @@
 3. **MRU**：成功打开才入册、全部历史无上限、失效条目不自动删、`forget` 生效；
 4. **降级**：0 个 profile → 只读错误；1 个 → 自动用；≥2 个 → 报错不猜；
 5. **自主护栏**：不在 allow 的动词被拒且**留审计**、节流跳过、`allow` 只能人给；
-6. **首页纯逻辑**：运行态五种措辞（"未编排"= 不知道，不是"没在跑"）。
+6. **首页纯逻辑**：运行态五种措辞（"未编排"= 不知道，不是"没在跑"）；
+7. **设置界面**（§9）：profile 留空不改、凭据只进钥匙串、删除连 `[llm]` 指针一起清、
+   `reconfigure` 热重建且模型没了时自主**可见地**停下。
 
 用法：python docs/smoke-home.py
 """
@@ -244,6 +246,24 @@ def main() -> int:
     check("无调度官时如实报错", bool(offline_result.error), offline_result)
     check("无调度官时不进自主", offline.enable is False)
 
+    # ---------------------------------------------------------------- 5a 新建即入册
+    print("· 新建成功即入册（首页列表的真源是 MRU；曾漏记 ⇒ 新建后列表不同步）")
+    made = ops.new("fresh-one", parent=str(work))
+    check("SocietyOps.new 之后 MRU 里有它",
+          made.get("ok") is True
+          and any(item["root"] == made.get("root") for item in recent.entries()),
+          (made, [item["root"] for item in recent.entries()][:3]))
+    check("重名新建被拒且不重复入册",
+          ops.new("fresh-one", parent=str(work)).get("ok") is False
+          and sum(1 for item in recent.entries()
+                  if item["root"] == made.get("root")) == 1)
+    import argparse as _ap
+    from puppethub import cli as _cli
+    _ns = _ap.Namespace(dir=str(work), name="cli-made", title="", json=True)
+    check("CLI `new` 也入册（同一纪律）", _cli.cmd_new(_ns) == 0
+          and any(item["root"].endswith("cli-made") for item in recent.entries()),
+          [item["root"] for item in recent.entries()][:3])
+
     # ---------------------------------------------------------------- 5b 自主回路
     print("· 自主回路：总线消息 → debounce 合并成**一轮** → 审计")
     import time as _time
@@ -330,6 +350,16 @@ def main() -> int:
     print("· 首页运行态措辞（「未编排」的意思是「我不知道」）")
     from puppethub.home import HomeWindow
     window = HomeWindow(fake, ops, None)
+    # reload 事件必须**重读 MRU**（旧实现只重渲染三块 ⇒ 数据对了、界面用旧快照重画；
+    # 实测症状：`recent.toml` 里已有新建的 app，左栏仍显示"（还没有项目）"）
+    window._reload()                       # 基线快照（此时还没有下面这个）
+    check("基线快照里还没有它",
+          not any(item["root"].endswith("fresh-two") for item in window.entries))
+    ops.new("fresh-two", parent=str(work))
+    window._apply("reload", None)          # 只走"事件"那条路径
+    check("reload 事件后列表含新建的 app（重读 MRU）",
+          any(item["root"].endswith("fresh-two") for item in window.entries),
+          [item["root"] for item in window.entries][:3])
     window.rows = [{"mode": "remote", "root": str(alpha.root), "port": 9401,
                     "name": "alpha", "pid": 111, "alive": True, "mine": False},
                    {"mode": "window", "root": str(beta.root), "port": 9402,
@@ -501,6 +531,86 @@ def main() -> int:
     check("停止实例（无头两个 + 窗口条目如实清账）",
           len(stopped["stopped"]) >= 2 and len(stopped["dead"]) >= 1, stopped)
     real.stop()
+
+    # ---------------------------------------------------------------- 9 设置界面
+    print("· 设置界面（模型 profile / 凭据 / 自主白名单 / 热重建）")
+    from puppethub import secrets
+    from puppethub.settings_ui import (_gated_verbs, delete_profile, pick_profile,
+                                       save_profile, set_allow)
+    from puppethub.society import SocietyOps as _SocietyOps
+
+    gated = _gated_verbs(_SocietyOps(FakeSociety(), log=lambda *_: None))
+    expected = (set(_SocietyOps.VERBS) - set(_SocietyOps.FREE_WHEN_AUTONOMOUS)
+                - set(_SocietyOps.FORBIDDEN))
+    check("可授权的动词是**派生**的（不手抄边界），也不含黑名单",
+          set(gated) == expected and "send" not in gated and "ls" not in gated, gated)
+
+    bad = save_profile("bad name!", base_url="https://x/v1")
+    check("名字不合规：拒绝且**不落盘**（前面的降级用例已经在里面写过别的 profile）",
+          bad["ok"] is False and secrets.profile("bad name!") is None, bad)
+
+    first = save_profile("alpha-model", base_url="https://api.example.com/v1",
+                         model="m1", key_env="ALPHA_API_KEY")
+    check("写 profile 落盘且可读回",
+          first["ok"] and secrets.profile("alpha-model")["model"] == "m1", first)
+    save_profile("alpha-model", base_url="")
+    check("留空 = **不改**（表单里的空白不该悄悄抹掉配置）",
+          secrets.profile("alpha-model")["base_url"] == "https://api.example.com/v1",
+          secrets.profile("alpha-model"))
+
+    with_key = save_profile("beta-model", base_url="https://api.example.com/v2",
+                            model="m2", api_key="sk-smoke-0123456789")
+    check("没给 key_env 时不丢钥匙：自动落到 `<NAME>_API_KEY`",
+          with_key["ok"] and secrets.profile("beta-model")["key_env"]
+          == "BETA_MODEL_API_KEY", with_key)
+    check("凭据只进钥匙串——配置文件里**没有它**（0600、app 目录之外）",
+          secrets.resolve("BETA_MODEL_API_KEY")[1] == "keystore"
+          and "sk-smoke" not in secrets.providers_path().read_text(encoding="utf-8"))
+
+    check("两个 profile 而不指定 = **报错不猜**（沿用既有降级口径）",
+          "不猜" in (orchestrator.resolve_model().get("error") or ""),
+          orchestrator.resolve_model())
+
+    picked = pick_profile("alpha-model")
+    raw = orchestrator.read_config()
+    check("选 profile 写进 orchestrator.toml",
+          picked["ok"] and str((raw.get("llm") or {}).get("profile")) == "alpha-model", raw)
+    resolved = orchestrator.resolve_model()
+    check("解析出来就是它（端点/model 来自 profile）",
+          resolved["options"]["base_url"] == "https://api.example.com/v1"
+          and resolved["options"]["model"] == "m1" and not resolved["error"], resolved)
+
+    # 白名单：写盘 + man3 热生效（**只能人给**，调度官改不了自己）
+    check("白名单落盘", set_allow(["up", "tell"])["ok"]
+          and sorted(orchestrator.read_config()["autonomous"]["allow"]) == ["tell", "up"],
+          orchestrator.read_config().get("autonomous"))
+    hot = orchestrator.Orchestrator(_SocietyOps(FakeSociety(), log=lambda *_: None),
+                                    log=lambda *_: None, provider=None,
+                                    provider_error="没有模型")
+    check("调度官读到的白名单就是人给的那份",
+          sorted(hot.config.get("allow") or []) == ["tell", "up"], hot.config.get("allow"))
+
+    rebuilt = hot.reconfigure()
+    check("reconfigure：**热重建**出真 provider（不必重启首页/社会层）",
+          rebuilt["ok"] is True and hot.provider is not None, rebuilt)
+    hot.start_autonomous()
+    check("自主随模型上线一起启动", hot.enable is True, hot.enable)
+
+    gone = delete_profile("alpha-model")
+    check("删除 profile 生效",
+          gone["ok"] and secrets.profile("alpha-model") is None, gone)
+    check("**连指向它的 [llm] profile 一起清掉**（不留悬空指针）",
+          "profile" not in (orchestrator.read_config().get("llm") or {}),
+          orchestrator.read_config().get("llm"))
+    set_allow([])
+    silenced = hot.reconfigure()
+    check("模型没了：自主**可见地**停下（不再是一个还能被触发的开关）",
+          silenced["ok"] is False and hot.enable is False
+          and "自主" in (silenced.get("note") or ""), silenced)
+    check("拆掉模型后自主回合如实报错（不静默空转）",
+          "未开启" in hot.turn("bus?", autonomous=True).error,
+          hot.turn("x", autonomous=True))
+    hot.stop()
 
     # ---------------------------------------------------------------- 收尾
     print("")
