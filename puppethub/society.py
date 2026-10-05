@@ -2,7 +2,7 @@
 
 ## 为什么需要它（它顺手修掉了一个既有缺陷）
 
-`puppethub hub <dir> up` 是 **one-shot**（`cli.py:265-268` → `hub.main` 打印完即
+`puppethub hub <dir> up` 是 **one-shot**（`cli.py:317-320` → `hub.main` 打印完即
 返回），而 `serve_bus` 起的是 **daemon 线程**（`hub.py:184-185`）。⇒ 命令一返回，
 总线就随进程消失，此后任何 `tell` 必然连不上。
 
@@ -18,7 +18,7 @@
 
 | | 作用域 | 账本 | 总线 |
 |---|---|---|---|
-| `puppethub hub <dir>`（CLI） | **父目录** | `parent/.puppethub-hub/state.json` | 父目录一条 |
+| `puppethub hub <dir>`（CLI） | **父目录** | `parent/.puppethub-hub/hub.json` | 父目录一条 |
 | 社会层（首页） | **整台机器** | `$PUPPETHUB_HOME/society.json` | 一条 |
 
 CLI 那条路的语义**原样不动**。
@@ -65,6 +65,13 @@ READY_TIMEOUT = 25.0
 WINDOW_READY_TIMEOUT = 15.0   # 窗口实例还要起 flet，给它短一点（起不来会被 2s 探活继续探到）
 INSTANT_EXIT_WAIT = 2.0       # `open` 之后等这么久：立刻死的子进程要被抓出来
 LOG_TAIL = 40
+
+
+def _brief(value, limit: int = 80) -> str:
+    """给转录一行用的短摘要（长返回值截断——转录不是数据面板）。"""
+    text = value if isinstance(value, str) else repr(value)
+    text = (text or "").replace("\n", " ")
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _pid_alive(pid) -> bool:
@@ -532,18 +539,24 @@ class SocietyOps:
     """
 
     VERBS = ("ls", "status", "bus", "who", "check", "open", "up", "down",
-             "fire", "call", "tell", "new", "forget")
+             "fire", "call", "tell", "new", "forget", "remember", "unremember")
 
-    # 自主时**默认允许**的动词：只读 + 消息刺激（其余默认拒绝，需人手动进 allow）
-    FREE_WHEN_AUTONOMOUS = ("ls", "status", "bus", "who", "check", "tell")
+    # 自主时**默认允许**的动词：只读 + 消息刺激 + **自己的记忆**
+    # （其余默认拒绝，需人手动进 allow。记忆放行与 app 侧同一条：反思要能沉淀）
+    FREE_WHEN_AUTONOMOUS = ("ls", "status", "bus", "who", "check", "tell",
+                            "remember", "unremember")
 
     # 黑名单：**刻意不实现**。留成常量只为让"边界是什么"可以被测试断言。
     FORBIDDEN = ("send", "load")
 
-    def __init__(self, society: Society, *, log=None, config: Optional[dict] = None):
+    def __init__(self, society: Society, *, log=None, config: Optional[dict] = None,
+                 memory=None):
         self.society = society
         self.log = log if log is not None else (lambda *_: None)
         self.config = dict(config or {})
+        # 调度官自己的长期记忆（`$PUPPETHUB_HOME/orchestrator/memory/`）。
+        # 它**不是**任何 app 的记忆，也不是任何 app 的真源——所以自主时也默认允许。
+        self.memory = memory
 
     def _note(self, level: str, code: str, message: str) -> None:
         self.log(level, code, message)
@@ -598,7 +611,11 @@ class SocietyOps:
         reply = self.society.request(found["name"], {"op": "hello"})
         if reply.get("ok") is False:
             return {"ok": False, "error": reply.get("error")}
-        return {"ok": True, "name": found["name"], "hello": reply}
+        service = reply.get("service") or {}
+        return {"ok": True, "name": found["name"], "hello": reply,
+                "note": "交互 %s · 借出 %s"
+                        % ("、".join(sorted(service.get("interactions") or [])) or "无",
+                           "、".join(service.get("lend") or []) or "空")}
 
     def check(self) -> dict:
         """只读探活（先 `/models` 再退化 1-token 对话）——模型通不通。"""
@@ -663,22 +680,53 @@ class SocietyOps:
     # ------------------------------------------------------------ 交互 / 调用
 
     def fire(self, app: str, target: str, event: str, row=None, value=None) -> dict:
-        """触发**对方自己声明的** handler——等价于"在它的窗口里点了一下"。"""
+        """触发**对方自己声明的** handler——等价于"在它的窗口里点了一下"。
+
+        **为什么要先核对声明的交互面**：引擎对"没有处理器的 `fire`"是**静默 no-op**
+        （`engine._dispatch` 只遍历匹配的处理器，无匹配就静静返回空），对**不存在的目标**
+        也一样。也就是说调用方会拿到一个 `ok` 和一个什么都没发生的世界。
+        所以这里按对端 `hello` 里**自己声明的** `interactions`（与 `service_manifest`
+        同一份派生）先核一道，不在里面就**可见拒绝并列出它声明了什么**——
+        "没列的交互不该被外部 agent 猜"，猜错必须看得出来。
+        （语言侧给出诊断是更彻底的修法：`TARGET_MISSING` / "事件没人接"，记录在案未做。）
+        """
         found = self.resolve(app)
         if "error" in found:
             return found
         if not target or not event:
-            return {"ok": False, "error": "`fire` 需要 `<目标> <事件>`（如 `#btn click`）"}
+            return {"ok": False, "note": "`fire` 需要 `<目标> <事件>`（如 `#btn click`）"}
+        declared = self.interactions(found["name"])
+        key = "#%s.%s" % (target.lstrip("#"), event)
+        if declared is not None and key not in declared:
+            return {"ok": False,
+                    "note": "`%s` 没声明交互 `%s`（它声明的是：%s）"
+                            % (found["name"], key,
+                               "、".join(sorted(declared)) or "（无）")}
         reply = self.society.request(found["name"],
                                      {"op": "fire", "target": target, "event": event,
                                       "row": row, "value": value})
         if reply.pop("ok", True) is False:
-            return {"ok": False, "error": reply.get("error") or "触发失败"}
+            return {"ok": False, "note": reply.get("error") or "触发失败"}
         diagnostics = reply.get("diagnostics") or []
         errors = [d.get("message") for d in diagnostics
                   if isinstance(d, dict) and d.get("level") == "error"]
         return {"ok": not errors, "diagnostics": diagnostics,
-                "error": "；".join(errors) if errors else ""}
+                "note": "；".join(errors) if errors else "已投递"}
+
+    def interactions(self, app: str):
+        """对端**自己声明**的交互面（`#目标.事件`）。
+
+        拿不到（实例没在跑 / 没应答）就返回 `None`——**不拦**，让真正的请求去报它的错，
+        免得把"连不上"伪装成"没声明这个交互"。
+        """
+        entry = self.society._entry_of(app)
+        if entry is None or not entry.get("port"):
+            return None
+        reply = self.society.request(app, {"op": "hello"})
+        if not reply.get("ok"):
+            return None
+        service = (reply.get("service") or {})
+        return set(service.get("interactions") or [])
 
     def call(self, app: str, name: str, args=None) -> dict:
         """借出能力调用。**调用权在被调方**（`[service] lend` 缺省空 = 默认拒绝）。"""
@@ -692,7 +740,8 @@ class SocietyOps:
                                      timeout=float(self.config.get("call_timeout", 30)))
         if reply.get("ok") is False:
             return {"ok": False, "error": reply.get("error")}
-        return {"ok": True, "value": reply.get("value")}
+        return {"ok": True, "value": reply.get("value"),
+                "note": "返回 %s" % _brief(reply.get("value"))}
 
     def tell(self, app: str, topic: str, text: str) -> dict:
         """经总线发消息（**刺激，不写入**）。路由按 topic——回执如实报谁收到。"""
@@ -704,8 +753,7 @@ class SocietyOps:
         delivered = reply.get("delivered") or []
         failed = reply.get("failed") or []
         return {"ok": True, "delivered": delivered, "failed": failed,
-                "note": "投递给 topic=%s 的订阅者；`%s` 只是意图标注"
-                        % (topic, app)}
+                "note": "投给 topic=%s 的订阅者" % topic}
 
     # ------------------------------------------------------------ 磁盘
 
@@ -733,3 +781,37 @@ class SocietyOps:
         removed = recent.forget(found["root"])
         return {"ok": removed, "root": found["root"],
                 "note": "" if removed else "列表里本来就没有它"}
+
+    # ------------------------------------------------------------ 自己的记忆
+
+    def remember(self, text: str, importance=1, tags=()) -> dict:
+        """记进**调度官自己**的长期记忆（跨会话）。
+
+        与 app 侧的 `remember` 同一套策略（落 `$PUPPETHUB_HOME/orchestrator/memory/`），
+        不碰任何 app。动词刻意不叫 `forget` 的反面——见 `unremember` 的注释。
+        """
+        if self.memory is None:
+            return {"ok": False, "note": "记忆不可用（宿主没装配）"}
+        try:
+            importance = int(importance)
+        except (TypeError, ValueError):
+            importance = 1
+        entry = self.memory.remember(text, importance=importance,
+                                     tags=list(tags or []), origin="orchestrator")
+        if entry is None:
+            return {"ok": False, "note": "文本是空的，没记"}
+        return {"ok": True, "id": entry["id"],
+                "note": "记住 %s：%s" % (entry["id"], (entry["text"] or "")[:60])}
+
+    def unremember(self, key: str) -> dict:
+        """忘掉自己的一条记忆。
+
+        **为什么不叫 `forget`**：`forget` 已经被"从项目列表移除一个 app"占用了；
+        一个动词两种含义（删记忆 vs 删列表项）= 猜错了就是删错数据。
+        """
+        if self.memory is None:
+            return {"ok": False, "note": "记忆不可用（宿主没装配）"}
+        removed = self.memory.forget(key, origin="orchestrator")
+        if not removed:
+            return {"ok": False, "note": "没有这一条（按 id 或**完整文本**匹配，不做模糊）"}
+        return {"ok": True, "removed": removed, "note": "忘掉 %d 条" % removed}

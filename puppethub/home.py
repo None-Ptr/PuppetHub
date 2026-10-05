@@ -29,8 +29,9 @@ LIST_MIN_WIDTH = 520
 BUS_TAIL_LINES = 5
 PROBE_INTERVAL = 2.0
 
-HINTS = ("↑↓ 选择 · Enter 打开 · n 新建 · o 打开目录 · u 拉起 · d 停止 · "
-         "f 遗忘 · m 自主 · r 重读 · q 退出")
+# 快捷键图：**两行**（一行放不下时会自己折成两行，那看起来像排版事故）
+HINTS = ("↑↓ 选择 · Enter 打开 · n 新建 · o 目录 · u 拉起",
+         "d 停止 · f 遗忘 · m 自主 · r 重读 · q 退出")
 
 KEYS_UP = ("arrowup", "arrow up", "up")
 KEYS_DOWN = ("arrowdown", "arrow down", "down")
@@ -96,8 +97,8 @@ class HomeWindow:
             self._install_autonomous_delta()
             self.orchestrator.start_autonomous()
         self._reload(reason="启动")
-        self._note_transcript("系统", "首页 = 社会层宿主（总线在**本进程**内）。" if self.orchestrator is not None
-                              else "没有调度官：社会台照常可用（键盘与按钮都在）。")
+        self._note_transcript("系统", "社会层就绪" if self.orchestrator is not None
+                              else "没有调度官")
         page.on_keyboard_event = self._on_key
         page.run_task(self._pump)
         page.run_task(self._periodic)
@@ -123,14 +124,14 @@ class HomeWindow:
         return ft.Container(
             expand=True, bgcolor=theme.BG, padding=ft.Padding(12, 8, 12, 8),
             content=ft.Column(expand=True, spacing=6, controls=[
-                theme.section("项目", "打开过的 app（零扫描：列表就是历史）"),
+                theme.section("项目"),
                 theme.rule(),
                 ft.Container(content=self.list_view, expand=True),
                 theme.rule(),
                 self.bus_view,
                 theme.rule(),
-                theme.mono(HINTS, size=theme.SIZE_MICRO, color=theme.DIM,
-                           selectable=False),
+                *[theme.mono(line, size=theme.SIZE_MICRO, color=theme.DIM,
+                             selectable=False, no_wrap=True) for line in HINTS],
                 self.status,
             ]))
 
@@ -143,11 +144,9 @@ class HomeWindow:
                            selectable=False),
                 theme.rule(),
                 theme.markup(self._unavailable_text(), size=theme.SIZE_DATA),
-                theme.mono("· 社会台照常可用：Enter 打开、n 新建、u 拉起、d 停止",
-                           size=theme.SIZE_MICRO, color=theme.DIM, selectable=False),
             ])
         else:
-            self.composer = theme.field(hint="对调度官说一句话（社会层）",
+            self.composer = theme.field(hint="对调度官说一句话",
                                         on_submit=self._submit)
             self.composer.on_focus = self._focus_on
             self.composer.on_blur = self._focus_off
@@ -162,8 +161,8 @@ class HomeWindow:
                 ft.Container(content=self.transcript, expand=True),
                 theme.rule(),
                 self.composer,
-                theme.mono("Enter 发送 · 上方快捷键在输入框未聚焦时生效",
-                           size=theme.SIZE_MICRO, color=theme.DIM, selectable=False),
+                theme.mono("Enter 发送", size=theme.SIZE_MICRO, color=theme.DIM,
+                           selectable=False),
             ])
         return ft.Container(
             width=PANEL_WIDTH, bgcolor=theme.RAISE,
@@ -173,8 +172,7 @@ class HomeWindow:
 
     def _unavailable_text(self) -> str:
         if self.orchestrator is None:
-            return ("本次以 `--no-llm` 启动：**没有调度官**（社会台照常）。\n"
-                    "要有调度官就别加这个开关，先配模型：`puppethub keys set <KEY_ENV>`")
+            return "`--no-llm`：没有调度官"
         error = getattr(self.orchestrator, "provider_error", "") \
             or "没有可用的 llm_provider"
         return "调度官不可用：\n%s" % error
@@ -234,9 +232,8 @@ class HomeWindow:
     def _render_list(self) -> None:
         controls = []
         if not self.entries:
-            controls.append(theme.markup(
-                "（还没有项目）——`n` 新建一个，或 `o` 打开一个已有目录。",
-                size=theme.SIZE_DATA, color=theme.DIM))
+            controls.append(theme.markup("（还没有项目）", size=theme.SIZE_DATA,
+                                         color=theme.DIM))
         for position, item in enumerate(self.entries):
             controls.append(self._row(position, item))
         self.list_view.controls = controls
@@ -307,12 +304,11 @@ class HomeWindow:
 
     def _render_bus(self) -> None:
         entries = self.society.bus_tail(BUS_TAIL_LINES)
-        controls = [theme.mono("总线（谁对谁说了什么）", size=theme.SIZE_MICRO,
+        controls = [theme.mono("总线", size=theme.SIZE_MICRO,
                                color=theme.DIM, selectable=False)]
         if not entries:
-            controls.append(theme.mono("（还没有记录：app 之间还没说过话）",
-                                       size=theme.SIZE_MICRO, color=theme.DIM,
-                                       selectable=False))
+            controls.append(theme.mono("（还没有记录）", size=theme.SIZE_MICRO,
+                                       color=theme.DIM, selectable=False))
         for entry in entries:
             if entry.get("delivery"):
                 text = "%s 投递回执 %s → ok=%s failed=%s" % (
@@ -422,7 +418,8 @@ class HomeWindow:
                 if line.strip():
                     self._note_transcript("assistant", "› " + line.strip())
         for item in result.actions:
-            note = item.get("note") or ""
+            # 说明写在 `note` 还是 `error` 里都要显示得出来：否则失败在界面上是一条空行
+            note = item.get("note") or item.get("error") or ""
             ok = item.get("ok", True)
             self._note_transcript("info" if ok else "warning",
                                   "%s %s" % (item.get("verb"), note))
@@ -454,7 +451,7 @@ class HomeWindow:
         item = self._selected()
         if item is None:
             return
-        self._note_transcript("info", "打开 %s（另起一个窗口进程）" % item["root"])
+        self._note_transcript("info", "打开 %s" % item["root"])
         self.page.update()
 
         def work():
@@ -472,7 +469,7 @@ class HomeWindow:
     def _act(self, verb: str) -> None:
         item = self._selected()
         if item is None:
-            self._note_transcript("warning", "列表是空的——没有可以对它 %s 的项目" % verb)
+            self._note_transcript("warning", "列表是空的：没有可 %s 的对象" % verb)
             self.page.update()
             return
 
@@ -568,8 +565,6 @@ class HomeWindow:
             threading.Thread(target=work, daemon=True, name="home-new").start()
 
         theme.overlay_scrim(self.page, "新建 app（CLI `new`）", ft.Column(spacing=8, controls=[
-            theme.mono("生成最小骨架（window + navbar + 内容容器），随后静态校验。",
-                       size=theme.SIZE_DATA, color=theme.DIM, selectable=False),
             theme.labeled("名字", name_field),
             theme.labeled("父目录", parent_field),
             theme.labeled("标题", title_field),
@@ -596,9 +591,7 @@ class HomeWindow:
             self._open_selected()
 
         theme.overlay_scrim(self.page, "打开已有目录", ft.Column(spacing=8, controls=[
-            theme.mono("必须是含 `app.puppet` 的目录；打开成功后进历史列表。",
-                       size=theme.SIZE_DATA, color=theme.DIM, selectable=False),
-            theme.labeled("目录", path_field),
+            theme.labeled("目录（含 `app.puppet`）", path_field),
         ]), actions=[theme.primary("打开", open_it),
                      theme.btn("取消", lambda _e: theme.close_overlay(self.page))])
 
@@ -623,8 +616,8 @@ class HomeWindow:
         if not running:
             self._destroy()
             return
-        text = ("社会层将**下线**：还有 %d 个实例在跑（它们仍在跑，但彼此的消息不通了）。\n"
-                "要看住它们：`puppethub hub <父目录> down`。" % running)
+        text = ("社会层将**下线**；仍有 %d 个实例在跑（彼此消息不通）。\n"
+                "停它们：`puppethub hub <父目录> down`" % running)
 
         def confirm(_event=None) -> None:
             theme.close_overlay(self.page)

@@ -37,9 +37,12 @@ class Memory:
     """`.puppet/memory/memory.jsonl` 的读写与裁剪。**所有写都经 storage 槽位**。"""
 
     def __init__(self, storage, log: Callable[[str, str, str], None],
-                 options: Optional[dict] = None):
+                 options: Optional[dict] = None, rel: Optional[str] = None):
         self.storage = storage
         self.log = log
+        # `rel` 可换：app 侧是 `.puppet/memory/memory.jsonl`；社会层笔记（调度官）
+        # 复用这一整套策略，只是落在 `$PUPPETHUB_HOME/orchestrator/` 下。
+        self.rel = rel or REL
         options = options or {}
         self.max_entries = int(options.get("max_entries", DEFAULT_MAX_ENTRIES))
         self.max_bytes = int(options.get("max_bytes", DEFAULT_MAX_BYTES))
@@ -51,7 +54,7 @@ class Memory:
     # ------------------------------------------------------------ 读
 
     def entries(self) -> List[dict]:
-        raw = self.storage.read_text(REL, "")
+        raw = self.storage.read_text(self.rel, "")
         out: List[dict] = []
         for line in raw.splitlines():
             line = line.strip()
@@ -65,7 +68,7 @@ class Memory:
                     # 人手工编辑过、写坏了：**不覆盖它**，但要说出来（否则人改的会被悄悄丢掉）
                     self.log("warning", "MEMORY_BAD_LINE",
                              "%s 里有无法解析的行：宿主会跳过它、**不会覆盖**，"
-                             "但每轮都会少读一条" % REL)
+                             "但每轮都会少读一条" % self.rel)
                 continue
             if isinstance(item, dict) and item.get("text"):
                 out.append(item)
@@ -184,7 +187,7 @@ class Memory:
         entries = self.entries()
         if not entries:
             return "（运行期记忆为空）"
-        lines = ["# 运行期记忆（%d 条，来自 %s）" % (len(entries), REL)]
+        lines = ["# 运行期记忆（%d 条，来自 %s）" % (len(entries), self.rel)]
         for item in sorted(entries, key=lambda e: -int(e.get("importance", 1))):
             tags = item.get("tags") or []
             lines.append("%s  [重要度 %s]  %s%s  (访问 %s 次, 最后 %s)  [%s]"
@@ -199,7 +202,7 @@ class Memory:
     def _write(self, entries: List[dict]) -> None:
         text = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in entries)
         # 经 storage 槽位：路径白名单、原子写、写失败标脏，一条都不少。
-        self.storage.write_text(REL, text)
+        self.storage.write_text(self.rel, text)
 
     @staticmethod
     def _next_id(entries: List[dict]) -> str:

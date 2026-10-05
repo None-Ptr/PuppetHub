@@ -6,7 +6,7 @@
 - 观察 = 项目列表 + 运行态（TCP hello）+ 总线尾 + 各端 `hello`；
 - 行动 = `SocietyOps` 白名单动词；
 - 工具 = 同上（它没有别的工具，**也没有 `send`/`load`**）；
-- 记忆 = `$PUPPETHUB_HOME/orchestrator/`（转录 / 审计 / 目标 / 长期记忆）。
+- 记忆 = `$PUPPETHUB_HOME/orchestrator/`（转录 / 审计 / 目标 / 长期记忆 `memory/memory.jsonl`）。
 
 **它与驾驶舱 LLM 是两个 agent**（各自会话、各自预算、各自审计）：调度官要常驻
 （社会视野不随窗口切换丢失），驾驶舱只服务一个 app。把两者塞进一个会话会让
@@ -27,12 +27,15 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from . import recent
 from .chat import FENCE, explanation_of
+from .memory import Memory
 from .secrets import _read_table, home_dir
 
 ORCH_CONFIG_FILE = "orchestrator.toml"
 ORCH_DIR = "orchestrator"
 HISTORY_K = 12                 # 与 chat.HISTORY_K 同值：文件里有的就是上下文里有的
 BLOCK_INFO = "society"
+
+MEMORY_REL = "memory/memory.jsonl"
 
 DEFAULTS = {
     "enable": True,            # 完全自主（总线消息即触发源）
@@ -119,6 +122,59 @@ def resolve_model(raw: Optional[dict] = None) -> dict:
               if table.get(key)}
     merged.update(options)                 # 显式键优先（与 app 侧一致）
     return {"options": merged, "profile": name, "note": note, "error": ""}
+
+
+class _HomeStorage:
+    """把 app 侧那套 `Memory` 接到**机器级目录**上。
+
+    `Memory` 只要求 storage 有 `read_text/write_text`——上限、语义化裁剪、坏行不覆盖、
+    访问标记全在 `Memory` 自己身上。这里只管一件事：**写不出社会层目录之外**。
+    """
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.problems: List[str] = []
+
+    def _path(self, rel: str) -> Path:
+        text = str(rel or "").replace("\\", "/").lstrip("/")
+        if not text or ".." in text.split("/") or ":" in text:
+            raise ValueError("社会层记忆只接受自己目录内的相对路径：%r" % rel)
+        return self.root / text
+
+    def read_text(self, rel: str, default: str = "") -> str:
+        path = self._path(rel)
+        if not path.is_file():
+            return default
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as ex:
+            # 读不出来**不吞**（记忆静默变少 = 后面每轮都在少依据）
+            message = "记忆读取失败（%s）：%s" % (rel, ex)
+            if message not in self.problems:
+                self.problems.append(message)
+            return default
+
+    def write_text(self, rel: str, text: str) -> str:
+        path = self._path(rel)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")     # 写失败往上抛：调用方会如实报
+        return str(path)
+
+
+def memory_store(log=None, options: Optional[dict] = None) -> Memory:
+    """社会层（调度官）自己的长期记忆：`$PUPPETHUB_HOME/orchestrator/memory/`。
+
+    **复用 app 侧 `memory.Memory` 的整套策略**（上限 + 语义化裁剪 + 坏行不覆盖 +
+    访问标记 + 每次写入留诊断），只换落点与 `rel`——不另造一套记忆语义，否则
+    "什么会被丢掉"这件事就有两种答案。
+
+    参数（`max_entries` / `max_bytes` / `context_chars`）缺省读 `orchestrator.toml`
+    的 `[memory]` 小节。
+    """
+    if options is None:
+        options = read_config().get("memory") or {}
+    return Memory(_HomeStorage(data_dir()), log or (lambda *_: None),
+                  options=options, rel=MEMORY_REL)
 
 
 def build_provider(options: dict, log=None) -> Tuple[object, str]:
@@ -243,6 +299,8 @@ class Orchestrator:
                 self.config[key] = value
         self.provider = provider
         self.provider_error = provider_error
+        # 调度官的长期记忆：**从 ops 取**（一个实例两处用会各记各的"本轮注入过"）
+        self.memory = getattr(ops, "memory", None)
         self.enable = bool(self.config.get("enable", True)) and provider is not None
         self.goal = self._read_goal()
         self.halted = False
@@ -343,6 +401,8 @@ class Orchestrator:
                 "status": status, "bus_tail": tail,
                 "goal": self.goal, "allow": sorted(self.config.get("allow") or []),
                 "autonomous": self.enable,
+                "memory": (self.memory.context_block() if self.memory is not None
+                           else "（未装配）"),
                 "provider_error": self.provider_error}
 
     def _observation_text(self) -> str:
@@ -380,6 +440,12 @@ class Orchestrator:
                              % (entry.get("from"), entry.get("topic"),
                                 entry.get("title") or "-",
                                 (entry.get("text") or "")[:120]))
+        lines.append("【记忆】")
+        lines.append(view["memory"] or "（空）")
+        if self.memory is not None:
+            storage = getattr(self.memory, "storage", None)
+            for problem in (getattr(storage, "problems", None) or []):
+                lines.append("  · %s" % problem)
         lines.append("【社会层】自主：%s；自主白名单：%s；目标：%s"
                      % ("开" if self.enable else "关",
                         "、".join(view["allow"]) or "空",
@@ -412,7 +478,10 @@ class Orchestrator:
             "fire <app> <目标> <事件> [行] [值]  # 触发对方自己声明的 handler\n"
             "call <app> <能力> [json]          # 调用对方借出的能力（被调方可拒绝）\n"
             "new <名字> [--at <父目录>] [--title <标题…>]  # 生成最小骨架\n"
-            "forget <app>                    # 从项目列表移除\n"
+            "remember <文本…> [--imp 1-3] [--tags a,b]  # 记进**你自己的**记忆（跨会话；\n"
+            "                                # 文本写在最前，开关放最后）\n"
+            "unremember <id 或完整文本>       # 忘掉自己的一条记忆\n"
+            "forget <app>                    # 从项目列表移除（与记忆无关的那件事）\n"
             "```\n"
             "\n"
             "纪律：\n"
@@ -422,8 +491,11 @@ class Orchestrator:
             "——不要把它们说成成功。\n"
             "3. 不值得动手就说明理由、**一行动词都不输出**。\n"
             "4. 危险动作（拉起/停止/新建）在自主时会被默认拒绝，除非人预先把它写进 "
-            "allow；被拒了别重试同一件事。" % (forbidden, BLOCK_INFO,
-                                            int(self.config["max_commands"]), BLOCK_INFO))
+            "allow；被拒了别重试同一件事。\n"
+            "5. `remember` 记的是**你自己**的社会层经验（谁订了什么话题、哪次起了冲突、"
+            "人纠正过你什么）。它不是 app 的记忆，也不能用来改 app。" % (forbidden, BLOCK_INFO,
+                                                              int(self.config["max_commands"]),
+                                                              BLOCK_INFO))
 
     def build_messages(self, request: str, *, autonomous: bool = False) -> List[dict]:
         history = self.history()[-HISTORY_K:]
@@ -489,6 +561,9 @@ class Orchestrator:
         if not commands:
             self.log("info", "ORCH_NO_ACTION", "本轮回复里没有任何动词，社会未发生变化")
         result.actions = self._execute_all(commands, autonomous=autonomous)
+        if self.memory is not None:
+            # 本轮注入过的记忆统一记一次"被访问"（每轮都写盘会让文件一直抖）
+            self.memory.flush_access()
         self._assess(result)
         self._audit_turn(result)
         return result
@@ -532,6 +607,10 @@ class Orchestrator:
             return {"verb": verb, "ok": False, "note": "执行异常：%s" % message}
         outcome.setdefault("verb", verb)
         outcome.setdefault("ok", True)
+        if outcome.get("ok") is False and not outcome.get("note"):
+            # 说明写在 `error` 里也要**显示得出来**：转录只认 `note`，
+            # 少了这一行，失败在界面上就是一条空行（"失败不可见"）。
+            outcome["note"] = str(outcome.get("error") or "失败（对端没给说明）")
         return outcome
 
     def _call(self, verb: str, rest: str) -> dict:
@@ -582,6 +661,19 @@ class Orchestrator:
                 return {"ok": False, "note": "`new` 需要一个目录名"}
             return self.ops.new(args[0], parent=flags.get("at", ""),
                                title=flags.get("title", ""))
+        if verb == "remember":
+            text = " ".join(args).strip()
+            if not text:
+                return {"ok": False, "note": "`remember` 需要文本"}
+            tags = [tag.strip() for tag
+                    in (flags.get("tags") or "").replace("，", ",").split(",")
+                    if tag.strip()]
+            return self.ops.remember(text, importance=flags.get("imp", 1), tags=tags)
+        if verb == "unremember":
+            key = " ".join(args).strip()
+            if not key:
+                return {"ok": False, "note": "`unremember` 需要 id 或完整文本"}
+            return self.ops.unremember(key)
         return {"ok": False, "note": "没有 `%s` 这个动词" % verb}
 
     # ------------------------------------------------------------ 节流 / 预算

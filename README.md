@@ -143,7 +143,7 @@ def create_llm_provider(api):      # 每个槽位一个工厂
   `hub` 编排（list/up/down/status/bus）· `remote` 服务化（真起无头进程）·
   `fuse` 融合（先体检干跑再执行）。**每个动作都是可被冒烟直接调用的方法**
   （`gui_tools.py`），浮层只是薄壳；语义一律在 service 层——CLI 与 GUI 同源，
-  靠 `smoke-gui.py` 第 8 节机制化断言
+  靠 `smoke-gui.py` 第 11 节机制化断言
 - **凭据体系（V5）**：`docs/design-credentials.md`——**三层解析**（进程环境变量 →
   本机钥匙串 `~/.puppethub/secrets.toml` 0600 → 报错说清试过哪两层）· **机器级 profile**
   （`~/.puppethub/providers.toml` 存端点/模型/凭据名，app 里只写 `[llm] profile = "名字"`，
@@ -160,13 +160,17 @@ def create_llm_provider(api):      # 每个槽位一个工厂
   （纯 app 实例、写者=无、`pointer=touch` 自述、真源快照内嵌、REQUIRES 进 requirements、
   **构建期解析**（缺包生成期就拒）+ **凭据 manifest**（capabilities.py 静态扫描 →
   `manifest.json`，移动容器按它注入环境变量）、干跑门），生成的工程可独立装载与交互
-  （headless 子进程实测）；最终 `flet build apk` 需 Android SDK（`--run-flet-build`
-  代跑，失败如实上报）。触摸语义规范见语言仓 05 §10
+  （headless 子进程实测）；最终 `flet build apk` **暂缓（用户决定）**——SDK/JDK 已就位，
+  卡在 flet 要求的 Flutter 3.44.8 获取（`--run-flet-build` 代跑，失败如实上报）。
+  触摸语义规范见语言仓 05 §10
 
 尚未实现（均**可见地**说明，不做假成功）：
 
-- `flet build apk` 的实际执行（需 Android SDK / 真机——生成工程与前置全部就绪）·
-  融合的 `drops`（V3.1，B 归档保证不丢）· 多写者语义（V4 方向）
+- `flet build apk`：**已实测成功**（真 APK 134 MB，含 Python 3.14 运行时与站点包；
+  逐关记录见 `docs/design-v3-mobile.md` §4.1）。**未验证**：真机安装与运行（无设备）
+- 以下**已决定不做**（理由见 `docs/design-v1-draft.md` §15 决策索引）：融合 `drops` · 融合
+  `needs_detail` 第三轮注入 · N>2 批量融合 · 总线跨机 · 写回文本补丁 · 多写者语义（违反单写者铁律；
+  协作 = 说话 + 调用对方借出的能力）· 首页跨进程盲区（接受，不做登记/锁）
 
 ## 自证脚本（都不联网，可重复跑）
 

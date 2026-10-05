@@ -4,13 +4,15 @@
 # 否决过：zip / 仓库直装（spec/ 会漂移出第二份）、安装包（打包流水线坑）。
 [project]
 name = "puppethub"
-version = "0.1.0"
-description = "OpenPuppet 的搭建与运行软件：让 LLM 孕育并驱动应用。"
+# 0.2.0：首页（裸跑即首页，社会层宿主）+ 调度官 + `run --hub-port/--listen-port` +
+# 凭据可落环境变量；0.1.0 已发 PyPI（2026-10-04）。
+version = "0.2.0"
+description = "OpenPuppet 的搭建与运行软件：让 LLM 孕育并驱动应用；裸跑即首页——多 app 协作与调度官。"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "None-Ptr" }]
-keywords = ["agent", "llm", "gui", "flet", "app-builder"]
+keywords = ["agent", "llm", "gui", "flet", "app-builder", "multi-agent", "orchestrator"]
 # 3.11 起才有 stdlib 的 tomllib——`puppethub.toml` 的解析用它（不引第三方依赖）。
 requires-python = ">=3.11"
 classifiers = [
@@ -30,7 +32,9 @@ dependencies = [
     # 语言标准实现（规范 + conformance + 参考实现）。
     # 范围收窄到 2.1：真源写回（序列化器）与 dialog 节点都在 2.1 落地，V1 主路径依赖前者。
     # 语言继续出修订时同一 app 的行为可能不同而人看不出来，故宁可拒绝启动。
-    "openpuppet-language>=2.1,<2.2",
+    # 下限 2.1.1：submit 载荷修复（移动键盘"完成键"）+ 用例 118；puppethub 的
+    # builder 产物依赖它。
+    "openpuppet-language>=2.1.1,<2.2",
     # 渲染**绑定** flet——它不是可插拔槽位，是产品的一部分。
     # 钉死版本：0.86 与 1.0 的 API 差异极大（字段改名、Signatures 变 kwargs）。
     "flet==0.86.5",
@@ -40,7 +44,10 @@ dependencies = [
 puppethub = "puppethub.cli:main"
 
 [build-system]
-requires = ["setuptools>=62"]
+# **>=77 不是随手写的**：`license = "MIT"`（PEP 639 的 SPDX 表达式）+ `license-files`
+# 需要 setuptools 77+ 才认识；地板低了，隔离构建会装出旧 setuptools 然后
+# InvalidConfigError——而那时报错的人是从 sdist 装的用户，不是本机。
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

@@ -105,6 +105,18 @@ def main() -> int:
     from puppethub.appdir import AppDir, create_app
     from puppethub.society import Society, SocietyOps
 
+    # 端到端用：真程序 + 真能力（`fire` 要有自己声明的 handler、`call` 要有借出的能力）
+    society_program = [
+        'add #root window #win title="协作"',
+        'add #win col #content pad=16',
+        'add #content button #go text="走"',
+        'on #go click:',
+        '    set #win title="走了"',
+    ]
+    society_caps = ('"""能力。"""\nfrom puppet import capability\n\n\n'
+                    '@capability(returns="str")\ndef shout(text: str) -> str:\n'
+                    '    """原样返回。"""\n    return text\n')
+
     # ---------------------------------------------------------------- 1 边界
     print("· 白名单边界（手被物理切断）")
     for banned in SocietyOps.FORBIDDEN:
@@ -261,6 +273,59 @@ def main() -> int:
     check("自主回路每轮都调一次 LLM（合并后 = 一次）",
           len(auto_provider.seen) == 1, len(auto_provider.seen))
 
+    # ---------------------------------------------------------------- 5c 长期记忆
+    print("· 调度官自己的长期记忆（`orchestrator/memory/`）")
+    from puppethub.orchestrator import memory_store
+
+    memory = memory_store(lambda *_: None)
+    mem_ops = SocietyOps(FakeSociety(), log=lambda *_: None,
+                         config={"plugins": {"openai-compat": {}}}, memory=memory)
+    check("落点就是设计里那个 memory/", memory.rel == "memory/memory.jsonl", memory.rel)
+    remember = mem_ops.remember("alpha 订阅 data，beta 订阅 ping", importance=2,
+                                tags=["订阅"])
+    check("记住一条", remember["ok"] and remember["id"] == "m1", remember)
+    memory_file = Path(os.environ["PUPPETHUB_HOME"]) / "orchestrator" / "memory" \
+        / "memory.jsonl"
+    check("写到盘上（可读可改的纯文本）",
+          memory_file.is_file()
+          and "beta 订阅 ping" in memory_file.read_text(encoding="utf-8"), memory_file)
+    check("注入块含这条", "beta 订阅 ping" in memory.context_block())
+    memory.flush_access()
+    check("回合末记一次访问（语义化裁剪要有依据）",
+          memory.entries()[0]["uses"] == 1, memory.entries()[0])
+    bare = SocietyOps(FakeSociety(), log=lambda *_: None)
+    check("没装配记忆时可见拒绝",
+          bare.remember("试试")["ok"] is False, bare.remember("试试"))
+
+    mem_orch = orchestrator.Orchestrator(
+        mem_ops, log=lambda *_: None,
+        provider=FakeProvider(["```society\n"
+                               "remember 人纠正过 up 的用法 --imp 3 --tags 教训\n```"]),
+        raw_config={"autonomous": {"enable": True}})
+    mem_result = mem_orch.turn("记一下")
+    check("`remember` 动词可用（文本在前、开关在后）",
+          mem_result.actions[0]["ok"] is True, mem_result.actions)
+    second = [item for item in memory.entries() if item["id"] == "m2"]
+    check("重要度与标签解析对了",
+          bool(second) and second[0]["importance"] == 3
+          and second[0]["tags"] == ["教训"], second)
+    check("记忆块进了提示词",
+          "beta 订阅 ping" in json.dumps(mem_orch.last_messages, ensure_ascii=False))
+    check("自主时记忆默认允许（反思要能沉淀）",
+          mem_orch.execute("remember", "自主时记一条", autonomous=True)["ok"] is True)
+    check("列表 forget 仍默认拒绝（记忆放行不等于放松）",
+          mem_orch.execute("forget", "alpha", autonomous=True)["ok"] is False)
+    gone = mem_ops.unremember("alpha 订阅 data，beta 订阅 ping")
+    check("按完整文本忘掉", gone["ok"] and gone["removed"] == 1, gone)
+    miss = mem_ops.unremember("根本没有这条")
+    check("忘不存在的条目如实报", miss["ok"] is False and "没有这一条" in miss["note"], miss)
+    try:
+        memory.storage.read_text("../../外面.txt")
+        escaped = False
+    except ValueError:
+        escaped = True
+    check("记忆适配器拒绝越界路径", escaped)
+
     # ---------------------------------------------------------------- 6 首页纯逻辑
     print("· 首页运行态措辞（「未编排」的意思是「我不知道」）")
     from puppethub.home import HomeWindow
@@ -349,9 +414,12 @@ def main() -> int:
     started = real.start()
     check("社会层上线（总线在**本进程**内）", bool(started.get("port")), started)
     for app in (alpha, beta):
-        config_path = app.config_path
-        config_path.write_text(config_path.read_text(encoding="utf-8")
-                               + '\n[collab]\nsubscribe = ["ping"]\n', encoding="utf-8")
+        app.write_source(list(society_program))
+        app.write_capabilities(society_caps)
+        # 借出清单与订阅都写在 app 自己的配置里：**调用权在被调方**、收件人看订阅
+        app.config_path.write_text(
+            'storage = "file"\n\n[service]\nlend = ["shout"]\n\n'
+            '[collab]\nsubscribe = ["ping"]\n', encoding="utf-8")
     up_rows = real.up([alpha.root, beta.root])
     check("两个实例都握手成功", all(row["ready"] for row in up_rows), up_rows)
     rows = real.rows()
@@ -360,8 +428,19 @@ def main() -> int:
     reply = real.tell("ping", "hello", sender="society")
     check("消息真送达订阅者（TCP 回执）",
           sorted(reply.get("delivered") or []) == ["alpha", "beta"], reply)
-    who = SocietyOps(real, log=lambda *_: None).who("alpha")
+    verbs = SocietyOps(real, log=lambda *_: None)
+    who = verbs.who("alpha")
     check("who 能拿到对端 hello（真 TCP）", who.get("ok") and who.get("hello"), who)
+    fired = verbs.fire("alpha", "#go", "click")
+    check("fire：投到**对端自己声明的** handler（真 TCP）", fired["ok"] is True, fired)
+    missed = verbs.fire("alpha", "#nope", "click")
+    check("fire：没声明的交互**可见拒绝**并列出它声明的（不是静默 no-op）",
+          missed["ok"] is False and "#go.click" in (missed.get("note") or ""), missed)
+    called = verbs.call("alpha", "shout", {"text": "嗨"})
+    check("call：借出能力跨进程同步返回",
+          called["ok"] is True and called.get("value") == "嗨", called)
+    refused = verbs.call("alpha", "nope", {})
+    check("call：没借出的能力被拒（调用权在被调方）", refused["ok"] is False, refused)
     tail = real.bus_tail(5)
     check("总线审计有记录", bool(tail), tail)
     check("总线账本是机器级一条", real.ledger_path().is_file(), real.ledger_path())
@@ -398,6 +477,25 @@ def main() -> int:
     who_window = SocietyOps(real, log=lambda *_: None).who("gamma")
     check("窗口实例答得了 who", who_window.get("ok") and who_window.get("hello"),
           who_window)
+
+    # 社会层 → 调度官的接线：总线消息 = 刺激源（首页就是把这两条线接起来的）
+    wake = orchestrator.Orchestrator(
+        SocietyOps(real, log=lambda *_: None), log=lambda *_: None,
+        provider=FakeProvider(["（消息已收到，暂不动手。）"]),
+        raw_config={"autonomous": {"enable": True, "debounce_seconds": 0.1,
+                                   "reflect_every": 0}})
+    real.on_peer_message = wake.notify
+    wake.start_autonomous()
+    baseline = len(wake.audit())
+    real.tell("ping", "有人在吗", sender="society")
+    deadline = _time.time() + 5.0
+    while _time.time() < deadline and len(wake.audit()) <= baseline:
+        _time.sleep(0.05)
+    wake.stop()
+    real.on_peer_message = None
+    woke = wake.audit()[baseline:]
+    check("总线消息能唤醒调度官（社会层 → 调度官的接线）",
+          len(woke) == 1 and "有人在吗" in woke[0].get("request", ""), woke)
 
     stopped = real.down()
     check("停止实例（无头两个 + 窗口条目如实清账）",

@@ -62,12 +62,16 @@ def cmd_home(args) -> int:
     `--no-llm` = 没有调度官（社会台照常：键盘与按钮都在）。
     """
     from .home import HomeWindow
-    from .orchestrator import Orchestrator, build_provider, resolve_model
+    from .orchestrator import (Orchestrator, build_provider, memory_store,
+                               resolve_model)
     from .society import Society, SocietyOps
 
     society = Society(log=_log_line)
     model = resolve_model()
-    ops = SocietyOps(society, log=_log_line,
+    # 调度官自己的长期记忆（`$PUPPETHUB_HOME/orchestrator/memory/`）——与 app 的记忆
+    # 同一套策略。`--no-llm` 时也要装配：文件可读可改，不因没有模型就凭空消失。
+    memory = memory_store(_log_line)
+    ops = SocietyOps(society, log=_log_line, memory=memory,
                      config={"plugins": {"openai-compat": dict(model["options"])}})
     orchestrator = None
     if args.no_llm:
@@ -131,9 +135,10 @@ def cmd_run(args) -> int:
         return 1
     diags = session.start()
     if args.hub_port:
-        # 协作总线端口（首页/`hub` 编排时注入）：**窗口实例也能说话**。
-        # 它仍然**收不到投递**（窗口不监听端口）——这是已知不对称，
-        # 见 docs/design-home.md 的"已知不对称"。
+        # 协作总线端口（首页/`hub` 编排时注入）：窗口实例**能说话**。
+        # 配合 `--listen-port` 它还能**收投递**（`HubWindow(listen_port=)` 在窗口
+        # 自己的进程里挂 TCP 绑定，见 docs/design-home.md §4.2）；只给 hub-port
+        # 不给 listen-port 时才是"只发不收"。
         session.attach_hub(args.hub_port)
     if args.wipe_memory:
         # 清空运行期记忆**必须显式**：这是唯一会抹掉"经历"的动作，重置状态不碰它。

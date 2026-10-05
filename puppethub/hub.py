@@ -267,6 +267,10 @@ def main(argv=None) -> int:
             print("  已拉起 %s → 127.0.0.1:%d（pid %d）"
                   % (item["name"], item["port"], item["pid"]))
         print("共 %d 个实例（已在跑的不动）。" % len(started))
+        # **诚实边界**：总线是本进程里的 daemon 线程——命令一返回它就没了，
+        # 此后 app 之间发消息必然连不上。要常驻的社会层请用首页（裸跑 `puppethub`）。
+        print("注意：协作总线随本命令退出而**下线**（此后 app 之间消息不通）。"
+              "要常驻的社会层直接裸跑 `puppethub`（首页即宿主）。", file=sys.stderr)
         return 0
     if args.action == "down":
         stopped, dead = down(parent)
