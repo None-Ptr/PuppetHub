@@ -4,9 +4,10 @@
 # 否决过：zip / 仓库直装（spec/ 会漂移出第二份）、安装包（打包流水线坑）。
 [project]
 name = "puppethub"
-# 0.2.0：首页（裸跑即首页，社会层宿主）+ 调度官 + `run --hub-port/--listen-port` +
-# 凭据可落环境变量；0.1.0 已发 PyPI（2026-10-04）。
-version = "0.2.0"
+# 0.3.0：规划层（```plan``` 块，步骤完成由**机制按判据核验**）· 技能组改"总纲常驻 +
+# 专项按需"（省 token 43.8%）· 自主主体性四件（交棒打锚 / 事后评价采证 / 经验固化）
+# · 感知层 watch 看门狗 · 0.2.0 已发 PyPI（首页 + 调度官 + 凭据落环境变量）。
+version = "0.3.0"
 description = "OpenPuppet 的搭建与运行软件：让 LLM 孕育并驱动应用；裸跑即首页——多 app 协作与调度官。"
 readme = "README.md"
 license = "MIT"
