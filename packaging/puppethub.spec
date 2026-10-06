@@ -29,7 +29,11 @@ PUPPET_ASSETS = assets_dir()
 # 语言包可能是**可编辑安装**（pip install -e）：PyInstaller 跟不到 site-packages 之外的
 # 包，必须把它的源码根显式交给 pathex。同时把本仓根给 puppethub（开发态未安装时）。
 PUPPET_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(puppet.__file__)))
-SPEC_ROOT = os.path.dirname(os.path.abspath(SPEC))
+# SPEC_ROOT = **仓库根**（本文件在 packaging/ 下，所以要上跳一级）。
+# 踩过的坑：写成 `os.path.dirname(SPEC)` 会得到 packaging/，图标路径就错了。
+SPEC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(SPEC)))
+# 注：原先这里有 `HUB_ASSETS`（窗口图标目录）。图标已随 assets/ 一并移除（2026-10-06），
+# 变量随之删除——**留着会让下一个人以为还有图标要打包**。
 
 # flet 的运行时不止 .py：icons.json 等数据文件与客户端二进制都必须进包
 # （实测：缺 icons.json 在启动时就炸）。collect_all 是包级全收，代价是体积。
@@ -46,6 +50,10 @@ a = Analysis(
         # 那是有意的：残缺分发宁可当场炸，不可晚炸成"功能坏了"。
         (PUPPET_ASSETS + "/spec", "share/puppet/spec"),
         (PUPPET_ASSETS + "/conformance", "share/puppet/conformance"),
+        # 注：曾在这里打包 `puppethub/assets`（窗口图标）。**2026-10-06 已移除**——
+        # 用户决定"不要图标"，`puppethub/assets/` 整个目录连同生成器一起删了。
+        # 若将来重做图标，记得**连生成器一起进 git**（`docs/*` 默认被 .gitignore
+        # 忽略，只有产物进库的话，改图只能人肉改二进制）。
     ],
     hiddenimports=["puppethub", "puppet", "flet"] + flet_hidden,
     hookspath=[],

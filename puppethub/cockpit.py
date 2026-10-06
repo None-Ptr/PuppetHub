@@ -260,6 +260,7 @@ class Cockpit:
                  weight=ft.FontWeight.BOLD),
             self.ops_writer,
             ft.Row(spacing=8, wrap=True, run_spacing=4, controls=[
+                btn("交棒给自主（打锚）", self._on_handoff),
                 btn("启动自主", lambda e: self._on_writer("autonomous")),
                 btn("暂停（无人写）", lambda e: self._on_writer("none")),
                 btn("交回共作者", lambda e: self._on_writer("llm")),
@@ -704,6 +705,11 @@ class Cockpit:
 
     def _on_writer(self, state: str) -> None:
         self.session.set_writer(state, origin="user")
+        self.repaint()
+
+    def _on_handoff(self, _event=None) -> None:
+        """交棒：打命名快照当回退锚，再把写者交给自主。"""
+        self.session.handoff_to_autonomous(origin="user")
         self.repaint()
 
     def _on_named(self, _event=None) -> None:

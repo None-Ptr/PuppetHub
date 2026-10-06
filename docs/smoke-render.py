@@ -153,26 +153,33 @@ def main() -> int:
     tracked = renderer._focused_key
     renderer.restore_focus()
     # 焦点期间外部改值**不得**写进部件（flet 对焦点中的 TextField 改 value
-    # 会把整段文本全选，实测"一输入就全选"）；失焦后下一帧再对齐。
+    # 会把整段文本全选，实测"一输入就全选"）；且**整树冻结**（祖先链每帧新建
+    # 会换父=重挂载=丢焦点，refocus 再全选——探针实证），失焦后下一帧对齐。
+    frozen = renderer.host.controls
     session.send(["set #name value=\"焦点外改值\""], origin="driver")
     session.refresh()
     during_focus = second.value
+    frozen_held = renderer.host.controls is frozen
     second.on_blur()
     tracked_after_blur = renderer._focused_key
     renderer.restore_focus()
     session.refresh()
     after_blur = second.value
+    unfrozen = renderer.host.controls is not frozen
     renderer.page = saved_page
     ok_focus = (tracked == ("name", None) and len(focus_calls) == 1
                 and tracked_after_blur is None and len(focus_calls) == 1)
-    ok_focus_skip = (during_focus == "外部值" and after_blur == "焦点外改值")
+    ok_focus_skip = (during_focus == "外部值" and after_blur == "焦点外改值"
+                     and frozen_held and unfrozen)
     print("   聚焦后记下 %r · 恢复调度 %d 次 · 失焦后清掉：%s"
           % (tracked, len(focus_calls), tracked_after_blur is None))
     print("   结论：%s" % ("焦点恢复生效" if ok_focus else "焦点恢复未生效"))
-    print("\n焦点期间不回写值：")
+    print("\n焦点期间整树冻结：")
     print("   焦点中 value=%r（应保持聚焦前的外部值）· 失焦后 value=%r（应对齐外部改值）"
           % (during_focus, after_blur))
-    print("   结论：%s" % ("不回写生效" if ok_focus_skip else "不回写未生效"))
+    print("   焦点中整树未动：%s · 失焦后重建：%s"
+          % (frozen_held, unfrozen))
+    print("   结论：%s" % ("冻结/解冻生效" if ok_focus_skip else "冻结/解冻未生效"))
 
     errors = [e for e in session.log if e["level"] == "错误"]
     print("错误数：%d" % len(errors))

@@ -24,7 +24,6 @@ from typing import Callable, Iterable, Optional
 import flet as ft
 
 from puppet import vocab
-from puppet.lang import Ref
 
 _MISSING = object()
 _EATEN = object()
@@ -305,12 +304,21 @@ class FletRenderer:
         self._overlay_owned: list = []      # 本渲染器上一帧放进 page.overlay 的覆盖层
         self._window_applied: dict = {}     # 我们上次写进真实窗口的尺寸/位置
         self.applied_window = (None, None)  # app 声明的 (w, h)——宿主的判据
+        self._last_shot: Optional[bytes] = None   # 上一次截图的字节（渲染生效校验用）
 
     # ------------------------------------------------------------ 入口
 
     def apply(self, snap: dict) -> list[tuple[str, str]]:
         """用一次**只读**渲染状态重建整棵控件树。返回本次的降级/异常报告。"""
         self.notes = []
+        if self._focused_key is not None:
+            # **焦点持有期整树冻结**：光复用输入框自身不够——它的祖先（col/row
+            # 的 Column 等）每帧都是新控件，flet 无 GlobalKey，换父 = 子树重挂载
+            # = 焦点丢；随后 restore_focus 重新聚焦会把整段文本全选（探针实证：
+            # 同实例换父 → 失焦 → refocus = 全选）。此刻部件本身就是真值（打字
+            # 经 change 事件进状态）；冻结期间积压的程序改动，失焦后由宿主安排
+            # 的重绘一次性对齐。
+            return list(self.notes)
         self._snap = snap
         self._controls = {}
         self._prev_inputs = self._inputs
@@ -747,16 +755,31 @@ class FletRenderer:
             cursor = node.parent if node is not None else None
         return True
 
-    async def capture(self) -> Optional[bytes]:
-        """视觉快照（可选观察面，仅供驱动者自检）。
+    async def capture(self, expect_change: bool = False) -> Optional[bytes]:
+        """视觉快照（可选观察面，**只读**，供驱动者/共作者自检）。
 
-        两个坑都是实测出来的，不是推演：① 刚 `update()` 完立刻截图会返回**空字节**；
+        三个坑都是实测出来的，不是推演（`docs/probe-frame-freshness.py` 可重跑）：
+        ① 刚 `update()` 完立刻截图会返回**空字节**；
         ② 页面没开 `page.enable_screenshots` 时**永远**返回空——那就不是"无头下截不了"，
-        而是"忘了开开关"（这正是它被写进这里的理由）。
+        而是"忘了开开关"（这正是它被写进这里的理由）；
+        ③ **同画面重复截图返回完全相同的字节——这是正确行为，不是卡帧。**
+
+        关于③的来历：`docs/shot-ui.py` 曾记「同进程反复 `take_screenshot()` 返回旧帧」。
+        本机实测（probe-frame-freshness.py）推翻了它：同画面 → 同字节（画面真没变，
+        字节相同才是对的）；**改动后立刻截图即为新帧**，无需等待；连续改动不粘连。
+        那条记录的真实成因是"那个状态的界面本就没变"，不是 flet 卡帧。
+
+        `expect_change=True` 时做**渲染生效校验**：调用者声明"界面应该变了"，
+        若截到的字节与上一次完全相同，说明**改动没进渲染树**（或 update 未生效），
+        此时返回 None 并由调用者报可见诊断——**绝不把一张与改动无关的图当成现状**。
         """
         for attempt in range(6):
             image = await self.page.take_screenshot()
             if image:
+                if expect_change and image == self._last_shot:
+                    # 声明"该变了"却没变：不猜是哪种原因，如实上报。
+                    return None
+                self._last_shot = image
                 return image
             await asyncio.sleep(0.15 * (attempt + 1))
         return None
@@ -938,14 +961,14 @@ class FletRenderer:
     def _build_input(self, node, snap, row, row_index):
         value = self._val(node.id, "value", snap, row)
         key = (node.id, row_index)
-        value_expr = node.attrs.get("value")
-        bound = isinstance(value_expr, Ref)     # value 绑定数据/其他节点 = 外部真值
         in_row = row_index is not None
         inner = self._prev_inputs.get(key)
-        # 行内且**未绑定**的输入框：不把声明值写回部件——行实例共享一个状态
-        # （引擎对这种输入跳过值同步并给 ROW_INPUT_SHARED 警告），每帧重设
-        # 声明初值会把用户正在打的字清掉。保留部件当前值 = 用户输入还在。
-        keep_user_value = in_row and not bound
+        # 行内输入框一律**非受控**：`value=t.xxx` 这类绑定（Local）只提供**首帧
+        # 初值**；之后部件是用户输入的真源，`change` 事件负责把值回写数据源。
+        # 每帧把绑定求值写回部件会把打字弹回（活绑定值在回写成功前还是旧的——
+        # 实测确认过）。引擎侧对行内输入跳过值同步（ROW_INPUT_SHARED 警告），
+        # 两侧是同一条语义。
+        keep_user_value = in_row
         # 输入框持有焦点期间**绝不回写 value**：flet 对焦点中的 TextField 改
         # value，Flutter 端会把整段文本全选（实测"一输入就全选"）。此刻部件本身
         # 就是真值（状态经 change 事件同步）；外部改值等失焦后下一帧再对齐。

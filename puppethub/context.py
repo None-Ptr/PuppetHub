@@ -1,8 +1,11 @@
 """基础上下文块：内核只提供原料，**组装交给 prompt 插件**。
 
 - **每轮固定**：真源全文 │ 最近 K 轮对话 │ 能力目录紧凑签名 │ 本轮诊断摘要 │
-  词汇边界（渲染器自述）│ `DESIGN.md` │ 资产清单。
-- **按需**：按**本轮触碰的词汇**检索的规范章节（关键词映射表，**不引向量库**）。
+  词汇边界（渲染器自述）│ `DESIGN.md` │ 资产清单 │ 常驻技能（`always`）。
+- **按需**：**技能为主**——`.md` 技能按触发词命中（请求 ∪ 程序源 ∪ **诊断文本**），
+  命中即注入（组内任一份命中则整组进）。**语言规范检索只做兜底**：当本轮
+  **没有任何非常驻技能命中**时，才按触碰词汇检索 `spec/` 章节——保住
+  "程序里出现的词汇自动关联规范"这条老能力，同时避免与技能重复注入。
 - **超限**：分级注入 + **显式声明省略**，绝不静默截断。
 
 两条不能让步的细节：
@@ -92,6 +95,25 @@ def capability_docs(catalog: List[dict], source: str, request: str) -> Dict[str,
         if doc and len(doc.splitlines()) > 1:
             out[name] = doc
     return out
+
+
+def _diagnostic_text(diagnostics) -> str:
+    """把诊断摘成纯文本（诊断码 + 消息），供技能触发词检索。
+
+    兼容两种形态：`Diagnostic` 对象（有 `.code` / `.message`）与 dict
+    （`{"code": …, "message": …}`）。**只取码与消息**——行号/级别对检索无用。
+    """
+    parts: List[str] = []
+    for diag in diagnostics or []:
+        if isinstance(diag, dict):
+            code = diag.get("code") or ""
+            message = diag.get("message") or ""
+        else:
+            code = getattr(diag, "code", "") or ""
+            message = getattr(diag, "message", "") or ""
+        if code or message:
+            parts.append("%s %s" % (code, message))
+    return "\n".join(parts)
 
 
 def request_tokens(request: str) -> List[str]:
@@ -191,21 +213,37 @@ def spec_sections(tokens: List[str], limit: int = SPEC_SECTION_LIMIT) -> List[di
 def build(*, app_dir, engine, catalog: List[dict], diagnostics: List[dict],
           turns: List[dict], rendering: dict, request: str, mode: str,
           budget: Optional[int] = None, stuck: str = "", memory: str = "",
-          fusion_brief: str = "", skills: list = ()) -> dict:
-    """产出基础上下文块。`turns` 是**已经截到 K 轮**的历史。"""
+          fusion_brief: str = "", skills: list = (), vision: dict | None = None,
+          role: str = "coauthor") -> dict:
+    """产出基础上下文块。`turns` 是**已经截到 K 轮**的历史。
+
+    `role` = `coauthor`（共作者 · 人在场）/ `operator`（当值者 · 自主自转）。
+    它**不进 SYSTEM**——身份是每轮变的处境，写在上下文里才不会被念反。
+    """
+    vision = vision or {}
     source = "\n".join(engine.program_lines())
     design = app_dir.read_design()
     assets = _assets(app_dir)
     # 检索源 = 程序触碰的词汇 + 请求文本的任务词（后者让"第一次就写对"成为可能：
     # 程序里还没有 remove_where 时，"删除这条记录"就能命中配方章节）。
     tokens = touched_tokens(engine, diagnostics) + request_tokens(request)
-    sections = spec_sections(tokens)
     # Skill（.md 文件）：显式触发词命中才注入——机制见 skills.select。
+    # 第三检索源 = **诊断文本**：诊断码只出现在诊断里（不在请求、不在源码），
+    # 不给这一源，`诊断速查` 这类技能永远不会被触发。
     from . import skills as _skills
-    skill_hits = _skills.select(list(skills or []), request, source)
+    skill_hits = _skills.select(list(skills or []), request, source,
+                                extra=_diagnostic_text(diagnostics))
+    # **以 skill 为主、spec 兜底**：有**非常驻**技能命中时，不再走规范关键词检索——
+    # 知识已由技能承担（更精准：带触发词、有组机制、按场景组织）。规范检索只在
+    # "技能一份都没命中"时兜底，保住"程序里出现的词汇自动关联规范"这条老能力。
+    always_names = {s.name for s in (skills or []) if getattr(s, "always", False)}
+    real_hits = [h for h in skill_hits
+                 if h.get("name") not in always_names and h.get("name") != "（未注入）"]
+    sections = [] if real_hits else spec_sections(tokens)
 
     context = {
         "mode": mode,
+        "role": role,                    # coauthor / operator（身份·每轮动态）
         "app_name": app_dir.name,
         "source": source,
         # 触碰能力的 docstring 全文（"有什么"常驻、"怎么用对"按需——见 capability_docs）。
@@ -227,6 +265,15 @@ def build(*, app_dir, engine, catalog: List[dict], diagnostics: List[dict],
             "interaction": bool(rendering.get("interaction")),
             "headless": bool(rendering.get("headless")),
             "notes": str(rendering.get("notes") or ""),
+        },
+        # **视觉感知边界**（`design-aesthetics.md` §4.2）：让 LLM 知道它能不能看见界面。
+        # `can_see=False` 时**必须**明说——否则它读到 `snapshot: true`（渲染器有截图能力）
+        # 会误以为自己看得见，然后凭空评价外观，那是赝品式的自信。
+        # 两项区分：渲染器支持截图（`snapshot`）≠ 本次对话真能收到图（`can_see`，
+        # 还取决于 provider 是否声明 vision）。
+        "vision": {
+            "can_see": bool(vision.get("can_see")),
+            "why_not": str(vision.get("why_not") or ""),
         },
         "diagnostics": diagnostics,
         "turns": turns,

@@ -145,6 +145,17 @@ def cmd_run(args) -> int:
     if args.wipe_memory:
         # 清空运行期记忆**必须显式**：这是唯一会抹掉"经历"的动作，重置状态不碰它。
         session.wipe_memory(origin="user")
+    if args.handoff:
+        # 交棒：先打命名快照当锚，再切写者。**没有锚就不交棒**——否则 app 一旦
+        # 进化偏了，人没有可回退的点（"偏离算进化"是好的，但它需要硬回退点兜着）。
+        outcome = session.handoff_to_autonomous(origin="user", reason="命令行 --handoff")
+        if not outcome.get("ok"):
+            print("交棒失败：%s" % outcome.get("reason", "见观察流"),
+                  file=sys.stderr)
+            return 1
+        if not outcome.get("already"):
+            print("已交棒给自主回路（回退锚 = 快照 %s）。人随时可点「交回共作者」拿回。"
+                  % outcome.get("snapshot", "?"))
     if args.json:
         print(json.dumps({"ok": True, "app": str(app.root),
                           "spec": session.spec_version,
@@ -520,6 +531,8 @@ def main(argv=None) -> int:
                        help="本实例的协作监听端口（首页 open 注入）：有它才收得到 tell")
     p_run.add_argument("--wipe-memory", action="store_true",
                        help="启动前清空运行期记忆（不给这个开关就一律保留）")
+    p_run.add_argument("--handoff", action="store_true",
+                       help="启动即交棒：打命名快照当回退锚，写者交给自主回路（无人在场）")
     p_run.set_defaults(func=cmd_run)
 
     p_remote = sub.add_parser("remote", help="远程/多客户端绑定（TCP，无头；写者=驱动者）")

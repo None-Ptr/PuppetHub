@@ -31,6 +31,11 @@ class OpenAICompatProvider:
         self.timeout = float(api.option("timeout", 180))
         self.temperature = api.option("temperature")
         self._limit = api.option("context_limit")
+        # **视觉能力由配置声明，保守缺省 false**（`design-aesthetics.md` §4.2）：
+        # 不知道模型支不支持看图就不发图——发了会 4xx，或被服务端静默丢掉。
+        # 真值只认 true/1/yes/on（字符串也算），其余一律 false。
+        raw_vision = api.option("vision", False)
+        self.supports_vision = str(raw_vision).strip().lower() in ("true", "1", "yes", "on")
 
     # -------------------------------------------------- 契约
 

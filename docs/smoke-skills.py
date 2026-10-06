@@ -20,7 +20,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, r"e:\Projects\Puppet")
+# 语言仓与 Hub 仓同级（`D:\OI\Projects\OpenPuppet\{Puppet,PuppetHub}`）。
+# 不写死盘符：D 盘是主线，E 盘只是冗余副本——写死会在换机/换盘时静默导入旧代码。
+sys.path.insert(0, str(ROOT.parent / "Puppet"))
 
 from puppet import Diagnostic, ERROR                      # noqa: E402
 from puppethub import skills as skill_mod                 # noqa: E402
@@ -44,24 +46,45 @@ def main() -> int:
     print("\n1) 内置配方加载")
     builtin, diags = skill_mod.load(str(app.root))
     names = sorted(s.name for s in builtin)
-    check("五份内置配方", names == ["列表与模板", "删改数据", "数字与文本", "读用户输入", "调用能力"],
-          names)
+    # 断言"内置目录里的文件数与加载数一致"，而不是写死份数：
+    # 加一份内置技能不该让冒烟变红（那是断言的问题，不是技能的问题）。
+    builtin_dir = Path(skill_mod.__file__).with_name("builtin_skills")
+    expected = sorted(p.stem for p in builtin_dir.glob("*.md"))
+    check("内置配方与目录一一对应（%d 份）" % len(expected),
+          names == expected, names)
     check("全部标记为内置", all(s.builtin for s in builtin))
     check("零诊断（内置文件是好的）", not diags, [d.message for d in diags])
 
     print("\n2) 触发词命中：请求原文 / 程序源")
+    # **常驻技能**（always: true，如"语言速查"）每轮都进且排最前——它不参与
+    # 触发词匹配，断言里要先摘掉它，否则测的是常驻而不是命中。
+    always_names = {s.name for s in builtin if getattr(s, "always", False)}
+
+    def auto(hits):
+        return [h for h in hits if h["name"] not in always_names]
+
+    check("有常驻技能（语言速查每轮必进）",
+          {"语言速查"} <= always_names, sorted(always_names))
     hits = skill_mod.select(builtin, "帮我把这条记录删掉", "")
-    check("请求说'删除'命中删改数据", [h["name"] for h in hits] == ["删改数据"],
+    check("命中项里常驻技能排最前", hits and hits[0]["name"] in always_names,
+          [h["name"] for h in hits])
+    check("请求说'删除'命中删改数据", [h["name"] for h in auto(hits)] == ["删改数据"],
           [h["name"] for h in hits])
     hits = skill_mod.select(builtin, "帮我算一下总价", "")
-    check("'总价'命中数字与文本", [h["name"] for h in hits] == ["数字与文本"],
+    check("'总价'命中数字与文本", [h["name"] for h in auto(hits)] == ["数字与文本"],
           [h["name"] for h in hits])
     hits = skill_mod.select(builtin, "", "on #d click: remove_where #t as r where r.x == 1")
-    check("程序源出现 remove_where 也命中", [h["name"] for h in hits] == ["删改数据"],
+    check("程序源出现 remove_where 也命中", [h["name"] for h in auto(hits)] == ["删改数据"],
           [h["name"] for h in hits])
     hits = skill_mod.select(builtin, "今天天气怎么样", "")
-    check("不相关请求 → 一个都不注入", hits == [], hits)
-    body = skill_mod.select(builtin, "把这条记录删掉", "")[0]["text"]
+    check("不相关请求 → 只有常驻技能注入（零噪音）",
+          auto(hits) == [], [h["name"] for h in hits])
+    # 第三检索源：诊断文本——诊断码只出现在诊断里，不给这一源，诊断类技能永不触发。
+    hits = skill_mod.select(builtin, "改一下", "", extra="SYNTAX 该行不符合语法")
+    check("诊断文本作第三源 → 命中诊断速查",
+          "诊断速查" in [h["name"] for h in hits], [h["name"] for h in hits])
+    hits = skill_mod.select(builtin, "把这条记录删掉", "")
+    body = [h["text"] for h in hits if h["name"] == "删改数据"][0]
     check("注入的是正文（含完整写法）", "remove_where" in body, body[:120])
 
     print("\n3) app 级目录：放文件即生效 + 同名覆盖内置")
@@ -124,6 +147,42 @@ def main() -> int:
     check("find 按名取技能", skill_mod.find(builtin, "调用能力") is not None
           and skill_mod.find(builtin, "不存在的") is None)
     check("index 给出取用指引", "```skill 名字```" in skill_mod.index_block(builtin))
+
+    print("\n8) 技能组：共同纪律常驻 + 专项细节按需（2026-10-06 改）")
+    # 改动前是「整组连坐」：命中任一份 → 全组进。实测一轮请求里技能占 78%，
+    # 而程序全文只占 1.5%——那与"按需注入"相反。改后：总纲（synopsis）常驻 +
+    # 只有命中的成员进，其余点名可自取。
+    a_group = [s for s in builtin if s.group]
+    check("内置技能里有成组的", bool(a_group), len(a_group))
+    leads = [s for s in a_group if s.synopsis]
+    check("每个组都有总纲（synopsis）", len(leads) == len({s.group for s in a_group}),
+          [(s.group, s.name, bool(s.synopsis)) for s in a_group])
+    check("总纲明显短于整份正文（否则省不下来）",
+          all(len(s.synopsis) < len(s.body) for s in leads),
+          [(s.name, len(s.synopsis), len(s.body)) for s in leads])
+    # 命中组内任一份：总纲 + 那一份进，**同组没命中的不进**
+    hits = skill_mod.select(builtin, "这个图标选得不好", "add #a button #b text=x")
+    names = [h["name"] for h in hits]
+    check("命中组内一份时，总纲在场（共同纪律没丢）",
+          any(s.synopsis and s.name in names for s in leads), names)
+    groups_touched = {s.group for s in a_group
+                      if any(h["name"] == s.name for h in hits)}
+    not_injected = [s.name for s in a_group
+                    if s.group in groups_touched and s.name not in names
+                    and not s.synopsis]
+    check("同组未命中的成员**不再连坐**（这是省 token 的关键）",
+          all(h["text"] != next(x.body for x in a_group if x.name == n)
+              for h in hits for n in not_injected), (not_injected, names))
+    # 未进的那几份必须**点名**（第一原则：不静默丢弃），且给出自取指引
+    pointer = [h for h in hits if h["name"] in {s.group for s in a_group}]
+    check("未注入的同组知识被点名 + 给出 ```skill 自取``` 指引",
+          bool(pointer) and all("```skill" in h["text"] for h in pointer),
+          [h["text"][:80] for h in pointer])
+    # 块标量：synopsis 是多行散文，解析器必须支持且不误报
+    _, fdiags = skill_mod.load(str(ROOT), log=None)
+    check("块标量 synopsis 不产生假 ERROR",
+          not [d for d in fdiags if d.level == "ERROR" and "冒号" in d.message],
+          [d.message[:60] for d in fdiags if d.level == "ERROR"][:3])
 
     shutil.rmtree(work, ignore_errors=True)
     print("\n%s" % ("全部通过" if not FAILED else "失败：%s" % "、".join(FAILED)))

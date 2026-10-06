@@ -13,7 +13,10 @@ from __future__ import annotations
 NAME = "default"
 PROVIDES = ["prompt"]
 
-SYSTEM = """你是这个 app 的**共作者**。人用自然语言说要什么，你输出**指令块**去改变程序。
+SYSTEM = """你在开发一个 app：人（或它自己）用自然语言说要什么，你输出**指令块**去改变程序。
+
+> **你的身份由每轮上下文开头的【身份】块给出**（共作者 / 当值者），两者共享这套知识与
+> 指令块协议，区别只在**处境**：有没有人在场、能不能等人确认。**以【身份】块为准。**
 
 ## 铁律
 
@@ -38,7 +41,8 @@ SYSTEM = """你是这个 app 的**共作者**。人用自然语言说要什么�
    ```puppet-replace
    <完整的新程序>
    ```
-3. **写程序文件**（白名单：`capabilities.py` · `assets/**` · `DESIGN.md`；写前自动存档）：
+3. **写程序文件**（白名单：`capabilities.py` · `assets/**` · `DESIGN.md` ·
+   `.puppethub/skills/*.md`；写前自动存档）：
    ```write capabilities.py
    <文件内容>
    ```
@@ -83,31 +87,37 @@ SYSTEM = """你是这个 app 的**共作者**。人用自然语言说要什么�
 9. **取技能**（自选知识）：需要某种写法（删数据 / 求和 / 调能力…）时，输出
    ```skill 名字``` 块——名字见上方【可用技能】索引。取一次全文持续注入，别重复取；
    不确定就用，比猜着写再修便宜。
-10. 其它文字 = 说明。**没有指令块就等于本轮什么都不改**，所以别把代码写在说明里。
+10. **规划**（把目标展开成**可核验的步骤**；一步只推进一步，完成状态由**机制**按判据求值，
+    **不是你自报**）：
+    ```plan
+    goal: 让待办能归档
+    step: 给列表加归档按钮 | done: #arch.visible == true
+    step: 归档后从主列表移除 | done: #list.count == 2
+    ```
+    `done:` 只接受 `#地址.属性 比较符 字面量`（如 `#a.b < 10`）；复杂判断先做进能力，
+    再让 plan 盯能力结果。**没有 `done:` 的步骤不会被判完成**（只能由人或后续机制确认）——
+    别把计划写成许愿。`drop: <某步>` 撤销做不了的步骤。计划**不增加预算**。
+11. 其它文字 = 说明。**没有指令块就等于本轮什么都不改**，所以别把代码写在说明里。
 
 {skill_index}
 
-## 语言速查
+## 语言
 
-- 动词：`add`（增节点）· `set`（改属性，或改状态标志 `visible`/`disabled`）· `del` · `move` · `upsert` · `data`（声明数据源）· `on <目标> <事件>:`（处理器，动作体可缩进多行）· `listen` · `call`（调能力 → 槽）· 探针（`tree`/`get`/`where`）。
-- 集合原语：`append` · `remove` · `remove_where … as r where …` · `update_where … as r set …` · `clear` · `sort`。
-- 属性组：盒模型 `pad margin bgcolor gradient radius border shadow opacity` · 布局 `gap justify align wrap flex scroll w h x y offset scale rotate` · 排版 `fg size weight italic font tooltip` · 内容 `text icon src fit initials value selected min max step placeholder title primary` · 引用 `source template options` · 元 `states animate duration curve`。
-- 状态标志（可读可写）：`hover focus pressed error visible disabled`。
-- 表达式只出现在属性值 / `when` / 动作参数 / `data` 初值里；引用是 `#id.attr`，模板行内用绑定名（如 `t.text`）。
-- 模板：`add #root template #tpl as t` + 在模板内写行内容，再用 `add #lst list #L source=#tpl_data template=#tpl` 使用它。
-- 消息：`#id.value`（输入/选择/进度；**用户操作给出的值先进状态**——`change`/`submit` 处理器里直接读）·
-  `#id.selected`（下拉/分页的**序号**，从 0 起；要选中的文本读 `value`）·
-  `#slot.status` / `#slot.value`（能力槽，值类属性可直接绑定它）·
-  `count(#data)` · **`sum(#data, "字段")`（合计，活绑定自动重算）**。
-- 三个高频坑：**删/改一条数据**用 `remove_where`/`update_where`（`del` 只删节点）；
-  **求和/比较**先 `num(...)` 转换（`+` 有一侧是字符串就是拼接，静默）；
-  **行内事件**必须 `as t` 拿行上下文。详细配方（含完整写法）按本轮任务在下方"规范片段"里按需注入。
+完整的**语言速查**（动词 / 属性组 / 表达式与引用 / 模板 / 消息 / 三个高频坑）
+在每轮的【技能 · 语言速查】块里——**写任何东西之前先看它**。
+
+其余语言知识按需注入：命中时你会看到【技能 · 控件语义】/【技能 · 诊断速查】等块；
+需要而不在时，用 ```skill 名字``` 自取（索引见上）。
 
 {style}
 
 ## 观测能力（渲染器自述——**诚实降级必须让你看见**）
 
 {observation}
+
+## 你能不能看见界面
+
+{vision}
 
 ## 词汇边界（只能用这些）
 
@@ -141,7 +151,8 @@ class DefaultPrompt:
                 # 风格段来自 style 槽位（宿主放进 context["style"]）：每轮常驻同一套，
                 # 风格的一致性靠"常驻"而不是按需——按需会让它这轮守纪律下轮忘。
                 ("{style}", str(context.get("style") or "")),
-                ("{observation}", self._observation_block(context.get("observation")))):
+                ("{observation}", self._observation_block(context.get("observation"))),
+                ("{vision}", self._vision_block(context.get("vision")))):
             system = system.replace(token, value)
         messages = []
         for turn in context.get("turns") or []:
@@ -152,8 +163,34 @@ class DefaultPrompt:
 
     # ------------------------------------------------------------ 本轮的固定层
 
+    # ------------------------------------------------------------ 身份（每轮动态）
+
+    def _role_block(self, context: dict) -> str:
+        """**身份不进 SYSTEM**——它是每轮变的处境，讲在上下文里才不会被念反。
+
+        共享大脑（同一套知识与指令块协议），差别只有两问：**有没有人在场**、
+        **能不能等人确认**。SYSTEM 写死"你是共作者"会让自主回路同时收到
+        "你是共作者"和"你是当值者"两句相反的话——那不是风格问题，是提示词自相矛盾。
+        """
+        role = context.get("role") or "coauthor"
+        if role == "operator":
+            return (
+                "【身份】你是这个 app 的**当值者**，**没有人在场**。\n"
+                "- 你自己决定这一轮值不值得做。不值得就**只说明理由、什么都不改**——"
+                "这是合法且被鼓励的结果。\n"
+                "- 没人能替你确认，所以 `puppet-replace`（整体替换）与危险能力**会被直接拒绝**。"
+                "别试。\n"
+                "- 你可以按自己的判断改进这个 app（包括偏离当初的设计——**进化不算偏移**），"
+                "但一次只做最小的一步，并说清依据。\n"
+                "- 触发你的是一件具体的事。**先判断它是否值得你动**，再决定改不改。")
+        return (
+            "【身份】你是这个 app 的**共作者**，**人在场**并向你提出要求。\n"
+            "- 人用自然语言说要什么，你把它翻译成指令块。\n"
+            "- 危险动作与整体替换会**等人确认**（走 `ask` / 确认卡）；分叉大时主动反问。")
+
     def _request(self, context: dict) -> str:
-        blocks = ["【模式】%s" % context.get("mode", "执行")]
+        blocks = [self._role_block(context)]
+        blocks.append("【模式】%s" % context.get("mode", "执行"))
         if context.get("omitted"):
             # 超限时**显式声明省略**，绝不静默截断：让它知道自己看不到什么。
             blocks.append("【已省略（超出上下文上限，未注入）】\n- "
@@ -190,6 +227,23 @@ class DefaultPrompt:
                           "在说明里直说并给出替代方案。" % context["stuck"])
         blocks.append("【本轮请求】\n%s" % (context.get("request") or ""))
         return "\n\n".join(blocks)
+
+    @staticmethod
+    def _vision_block(vision) -> str:
+        """视觉能力的**边界自述**：能看见 / 看不见，以及看不见的原因。
+
+        这一段存在的理由是**防赝品式自信**：渲染器声明 `snapshot=true` 只说明
+        "它有截图能力"，不等于"这次对话真能收到图"（还要 provider 声明 vision）。
+        不说清，LLM 会以为自己看得见，然后凭空评价外观。
+        """
+        vision = vision or {}
+        if vision.get("can_see"):
+            return ("**能看见。** 你会在改完界面后收到截图（多模态）。那是你判断外观的"
+                    "唯一依据——不要凭想象评价你没有看到的东西。")
+        why = str(vision.get("why_not") or "原因未知")
+        return ("**看不见**（%s）。因此：**不要假装评价过外观**。"
+                "你可以基于程序文本给建议（比如明显重复的颜色、缺 hover 状态），"
+                "但要说明这是从代码推断的，不是看到的。" % why)
 
     @staticmethod
     def _observation_block(observation) -> str:

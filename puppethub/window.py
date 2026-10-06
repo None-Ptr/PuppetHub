@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import threading
 
 import flet as ft
@@ -73,6 +75,13 @@ class HubWindow:
                                      on_local_change=self.repaint,
                                      assets_dir=str(self.session.app.assets_dir))
         self.session.renderer = self.renderer
+        # 把窗口自己事件循环的句柄交给 session：截图是 async 且**必须在这个循环里**跑，
+        # 而后台线程（对话 / 自主步进）要同步拿到图——session.capture_for_llm() 靠它桥接。
+        try:
+            self.session._ui_loop = asyncio.get_running_loop()
+        except RuntimeError as ex:  # noqa: BLE001 - 拿不到就明说，截图会可见降级
+            self.session.note("warning", "SNAPSHOT",
+                              "取不到窗口事件循环（%s）：共作者将看不到界面" % ex)
         self.cockpit = Cockpit(self.session, self.repaint, page)
         # 流式输出：LLM 逐字吐，界面逐字上屏（以流为主，实时性不在插件层丢）。
         self.session.on_delta = self.cockpit.push_delta
@@ -138,6 +147,11 @@ class HubWindow:
                 pass
 
         self._install_close_guard(page)
+        # 窗口图标：**有意不设**（2026-10-06，用户决定"不要图标"）。
+        # 这里不装图标钩子，因为**没有图标不是降级，是选定的状态**——
+        # 若留一个 ICON_MISSING 警告，每次启动都报"图标缺失"，那是**假警报**
+        # （第一原则要的是"真实失败可见"，不是"任何缺东西都喊"）。
+        # 平台会用它自己的默认图标，那正是现在的预期行为。
         self.session.start()
         self.repaint()
 
@@ -230,6 +244,11 @@ class HubWindow:
 
     def _destroy(self, force: bool = False) -> None:
         self.session.note("info", "SHUTDOWN", "关窗 = app 结束；再次 run 会从 .puppet/ 恢复状态")
+        # 挂起的合并重绘别再触发：page 即将消失，定时器再跑只会撞上死对象。
+        with self._defer_lock:
+            if self._defer_timer is not None:
+                self._defer_timer.cancel()
+                self._defer_timer = None
         if force:
             self._close_overlay()
         self.page.window.prevent_close = False
@@ -254,9 +273,14 @@ class HubWindow:
             # 输入法当场被打断（实测"一输入就消失"）。合并到打字停顿后再刷；
             # 渲染器侧输入框实例已跨帧复用，这里是第二道保险（降低重建频率）。
             self._defer_repaint()
+        elif (event == "blur" and node is not None and node.type == "input"
+              and not self._declared_handler(node_id, event)):
+            # 失焦：渲染器在焦点期间整树冻结（见 render.apply），这里安排一次
+            # 合并重绘，把冻结期间积压的程序改动一次性上屏（解冻）。
+            self._defer_repaint()
         elif (event in ("focus", "blur") and node is not None and node.type == "input"
               and not self._declared_handler(node_id, event)):
-            # 程序没声明 focus/blur 处理器：这个事件在语义上什么都不会变，重绘
+            # 程序没声明 focus 处理器：这个事件在语义上什么都不会变，重绘
             # 唯一的效果就是把正聚焦的输入框重挂载、焦点当场丢掉（实测"点进
             # 输入框打不了字"）。不刷。
             pass

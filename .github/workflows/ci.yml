@@ -77,5 +77,8 @@ jobs:
       - name: 渲染层字段面探针（重跑即校验 flet 依赖的字段没漂）
         run: xvfb-run -a python docs/probe-flet-fields.py
 
+      - name: 语言规范 → 技能副本同步校验（spec 改了而没重生成 → 当场失败）
+        run: python docs/sync-spec-skills.py --check
+
       - name: 字节码编译检查
         run: python -m compileall -q puppethub

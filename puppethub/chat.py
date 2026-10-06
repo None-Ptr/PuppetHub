@@ -112,6 +112,14 @@ def parse_response(text: str) -> Tuple[List[Block], List[Diagnostic]]:
         elif kind == "goal":
             # `​```goal```：设定自主回路的目标（V4 C）。body 即目标文本。
             blocks.append(Block("goal", text_body, info=info))
+        elif kind == "watch":
+            # `​```watch```：LLM 自设定时/阈值看门狗（cron 交给 LLM，见 discuss-sensing.md §4）。
+            # body 是行式 `key: value`：every / when / why。校验与落盘在 session.set_watch。
+            blocks.append(Block("watch", text_body, info=info))
+        elif kind == "plan":
+            # ````plan```：把 goal 展开成**可核验的步骤**（规划层，见 review-agent-gap.md §2.4）。
+            # body 是行式：goal / step（可带 `| done: 判据`）/ drop。校验落盘在 session.set_plan。
+            blocks.append(Block("plan", text_body, info=info))
         elif kind == "skill":
             # `​```skill 名字```：LLM **主动取**一份技能的全文（自选知识通道）。
             # 取技能不是写入——它只影响后续轮次的上下文，谁当值都可以取；
@@ -128,7 +136,7 @@ def parse_response(text: str) -> Tuple[List[Block], List[Diagnostic]]:
             diags.append(Diagnostic("LLM_BLOCK_UNKNOWN", WARNING,
                                     "不认识的代码块 `%s`，已忽略（有效的是 puppet / "
                                     "puppet-replace / write <路径> / ask / remember / forget / "
-                                    "tell <app> <topic> / goal / skill <名字>）" % info))
+                                    "tell <app> <topic> / goal / watch / plan / skill <名字>）" % info))
     return blocks, diags
 
 
@@ -238,6 +246,12 @@ class Chat:
         self._fail_streak = 0
         self._approved: set = set(self.storage.read_json(".puppethub/approvals.json", []) or [])
         self._asset_manifest: set = set(self.storage.read_json(".puppethub/assets.json", []) or [])
+        # 视觉感知（`design-aesthetics.md`）：共作者能看到自己画出的界面。
+        # `_saw_skeleton` 记"骨架已首看过"（只触发一次）；`_visual_turns` 是
+        # **视觉迭代预算**——连续靠图驱动的轮数，防"看了改、改了看"的自转。
+        self._saw_skeleton = False
+        self._visual_turns = 0
+        self._visual_used: Optional[str] = None      # 本轮视觉来源（"骨架"/"批末"/None）
 
     @property
     def history_rel(self) -> str:
@@ -301,10 +315,25 @@ class Chat:
         context = self._context(request)
         self.last_prompt = context
         result.prompt_chars = context["size"]["total"]
+        # **视觉感知**：该不该请 LLM 看一眼自己画的东西？图挂在本轮消息末尾
+        # （它是对"本轮回复"的语境补充，不是独立回合）。取不到图/预算耗尽时
+        # 有可见日志，不静默跳过。
+        self._visual_used = None
+        visual_msg = None
+        why = self._should_look()
+        if why is not None:
+            if self._visual_budget_ok():
+                visual_msg = self._visual_message(why)
+                if visual_msg is not None:
+                    # 计数已内聚在 _visual_budget_ok()（判断即计数），此处不再 +1。
+                    self._visual_used = why
+        else:
+            # 没触发视觉 → 视觉自转链断开，预算清零（新一轮"想改"重新计数）。
+            self._visual_turns = 0
         try:
             self.streaming = True
             try:
-                text = self._stream(self._messages(context))
+                text = self._stream(self._messages(context, visual=visual_msg))
             finally:
                 self.streaming = False
         except Exception as ex:  # noqa: BLE001 - provider 失败：保留已流出片段（见 §16.7）
@@ -331,6 +360,111 @@ class Chat:
         self._assess(result)
         return result
 
+    def _vision_state(self) -> dict:
+        """本会话的视觉能力自述——**让 LLM 知道自己的感知边界**。
+
+        三种"看不见"各有其因，都要能说清（`design-aesthetics.md` §4.2）：
+        渲染器不支持截图 / provider 未声明视觉 / 无窗口实例（控制面）。
+        """
+        if self.provider is None:
+            return {"can_see": False, "why_not": "没有 llm_provider，无对话"}
+        if not getattr(self.provider, "supports_vision", False):
+            return {"can_see": False,
+                    "why_not": "当前 provider 未声明 vision（配置里写 vision=true 以启用）"}
+        if not self.session.hello()["rendering"].get("snapshot"):
+            return {"can_see": False, "why_not": "当前渲染器未声明截图能力（snapshot=false）"}
+        if self.session._ui_loop is None:
+            return {"can_see": False,
+                    "why_not": "本实例没有窗口（控制面 / 无头绑定），截不到界面"}
+        return {"can_see": True, "why_not": ""}
+
+    # ------------------------------------------------------------ 视觉感知
+
+    def _vision_available(self) -> bool:
+        """这条路通不通：provider 声明 vision **且**渲染器有截图能力。
+
+        **保守缺省**：provider 没声明就是没视觉（不知道就不发，免得撞墙）。
+        """
+        if self.provider is None:
+            return False
+        if not getattr(self.provider, "supports_vision", False):
+            return False
+        return bool(self.session.hello()["rendering"].get("snapshot"))
+
+    def _should_look(self) -> Optional[str]:
+        """这一刻要不要请 LLM 看一眼自己的作品？返回来源标签或 None。
+
+        三条触发路径（`design-aesthetics.md` §3.2），按优先级：
+          · 批末回灌：上一轮命令批真改动了真源（一次性信号，取走即清）
+          · 骨架首看：程序里第一次出现 window（只触发一次）
+          · 人喊它看：由 `session.want_visual()` 置位（驾驶舱按钮 / REPL）
+        """
+        if not self._vision_available():
+            return None
+        # 人主动喊优先（明确意图压过自动触发）。
+        if getattr(self.session, "take_visual_request", None) and self.session.take_visual_request():
+            return "人请它看"
+        changed = self.session.take_visual_change()
+        if changed is not None:
+            return "批末回灌"
+        if not self._saw_skeleton:
+            engine = self.session.engine
+            if any(getattr(n, "type", None) == "window" for n in engine.program.nodes.values()):
+                self._saw_skeleton = True
+                return "骨架首看"
+        return None
+
+    def _visual_message(self, why: str) -> Optional[dict]:
+        """要一张图 + 拼一条**多模态** user 消息（text + image_url）。
+
+        只发**图 + 增量**（`design-aesthetics.md` §4）：不重复整份程序——
+        基础上下文里已有 `source`，这里补的是"我刚动过什么"。
+        """
+        from . import session as _session_mod
+        pending = getattr(self.session, "_visual_pending_lines", None)
+        image = self.session.capture_for_llm(expect_change=(why == "批末回灌"))
+        if not image:
+            # 想给图没给成：**必须说出来**，否则 LLM 以为自己在看现状。
+            self.log("warning", "SNAPSHOT",
+                     "本轮想看界面（%s）但没取到图：共作者这一轮看不到样子" % why)
+            return None
+        import base64
+        b64 = base64.b64encode(image).decode("ascii")
+        delta = ""
+        if why == "批末回灌" and pending:
+            lines, _affected = pending
+            shown = "\n".join("  " + str(x) for x in lines[:20])
+            if len(lines) > 20:
+                shown += "\n  …（本轮共 %d 行）" % len(lines)
+            delta = "\n我这一轮改的内容：\n%s\n" % shown
+        text = ("【这是你刚做出来的界面】%s。%s\n"
+                "看一眼：层级清楚吗？颜色有没有堆太多？间距是不是一套值？"
+                "深底上的字看得清吗？\n"
+                "如果确实有该改的，直接用命令批改；**如果看着没问题，就说一句"
+                "「看着没问题」然后停下**——不要为了改而改。"
+                % (why, delta))
+        return {"role": "user", "content": [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
+        ]}
+
+    def _visual_budget_ok(self) -> bool:
+        """视觉迭代预算：连续靠图驱动的轮数到顶就停手交人（复用 FAIL_BUDGET 哲学）。
+
+        **判断即计数**：调用成功就 +1（内聚在本人身上，避免调用方忘了推进）。
+        到顶那一次返回 False 并留下 `LLM_STUCK` 同款说明（**可见**，不是悄悄停）。
+        """
+        if self._visual_turns >= self.fail_budget:
+            if self._visual_turns == self.fail_budget:
+                self.stuck_note = ("视觉迭代已达 %d 轮仍未收敛（等价于连续失败预算）。"
+                                   "请人工看一眼，或明确要求\"就这样吧\"。"
+                                   % self._visual_turns)
+                self.log("warning", "LLM_STUCK", self.stuck_note)
+            self._visual_turns += 1     # 只喊一次
+            return False
+        self._visual_turns += 1
+        return True
+
     # ------------------------------------------------------------ 上下文与提示
 
     def _context(self, request: str) -> dict:
@@ -345,6 +479,9 @@ class Chat:
                 limit = self.provider.context_limit()
             except Exception:  # noqa: BLE001
                 limit = None
+        # **身份由写者身份派生**（不进 SYSTEM）：共作者=人在场、自主=当值者自转。
+        # 共享同一套知识与指令块协议，差别只在处境——这样"共享大脑"才不会自相矛盾。
+        role = "operator" if self.origin == "autonomous" else "coauthor"
         context = _context.build(
             app_dir=self.session.app, engine=self.session.engine,
             catalog=self.session.catalog(), diagnostics=diagnostics, turns=turns,
@@ -352,7 +489,9 @@ class Chat:
             mode=self.mode, budget=limit, stuck=self.stuck_note,
             memory=self.memory.context_block() if self.memory is not None else "",
             fusion_brief=self.session.fusion_brief_text(),
-            skills=self.session.skills)
+            skills=self.session.skills,
+            vision=self._vision_state(),
+            role=role)
         # LLM **已取**的技能全文并入（不受 select 预算限制——它主动要的必须给全）；
         # 与自动命中去重。技能是知识：取一次、本会话持续有效。
         taken = {s.name: s.body for s in (self.session.skills or [])
@@ -369,7 +508,7 @@ class Chat:
         context["skill_index"] = skills_mod.index_block(list(self.session.skills or []))
         return context
 
-    def _messages(self, context: dict) -> List[dict]:
+    def _messages(self, context: dict, visual: Optional[dict] = None) -> List[dict]:
         """跑 prompt 插件链。每个插件可以**完全改写**上一步的结果。"""
         current = {"system": "", "messages": []}
         self.last_chain = []
@@ -407,6 +546,10 @@ class Chat:
         if current.get("system"):
             messages.append({"role": "system", "content": current["system"]})
         messages.extend(current.get("messages") or [])
+        if visual is not None:
+            # 图挂在**最后**：它是对本轮语境的补充（"这是我刚做出来的"），
+            # 放在请求之前，LLM 读到时正好准备回应。
+            messages.append(visual)
         if not messages:
             # 一个 prompt 插件都没产出 → **不能发空请求**（那等于让 LLM 凭空猜），
             # 也不能装作正常：退回"只发原始上下文"，并把它说出来。
@@ -523,6 +666,25 @@ class Chat:
                 result.applied.append("目标已设定：%s" % block.body.strip()[:60])
             else:
                 result.skipped.append("目标写入失败")
+        for block in [b for b in blocks if b.kind == "watch"]:
+            ok, diag = self.session.set_watch(block.body.strip(), origin=self.origin)
+            if ok:
+                result.applied.append("watch 已设定：%s" % block.body.strip()[:60])
+            else:
+                if diag:
+                    result.diagnostics.append(diag)
+                result.skipped.append("watch 被拒" + (("：" + diag["message"]) if diag else ""))
+        for block in [b for b in blocks if b.kind == "plan"]:
+            ok, info = self.session.set_plan(block.body.strip(), origin=self.origin)
+            if ok:
+                result.applied.append("计划已设定：%d 步（其中 %d 步可核验）"
+                                      % (info.get("steps", 0), info.get("judged", 0)))
+                if info.get("dropped"):
+                    result.applied.append("已撤销 %d 步（做不了的）" % len(info["dropped"]))
+            else:
+                if info:
+                    result.diagnostics.append(info)
+                result.skipped.append("计划被拒" + (("：" + info["message"]) if info else ""))
         for block in [b for b in blocks if b.kind == "skill"]:
             self._take_skill(block.path, result)
 
@@ -618,20 +780,50 @@ class Chat:
             # 能力变了要**显式重载**：否则 LLM 以为加了能力，其实引擎里没有。
             self.session.reload()
             result.applied.append("已重载能力模块")
+        if self._skill_path(path):
+            # 技能同理：写完不重载 = LLM 以为经验生效了，其实下轮照样犯同样的错。
+            # 那是"静默失败"的一种伪装——它会把自己的失败当成没发生过。
+            before = len(self.session.skills or [])
+            diags = self.session.reload_skills()
+            after = len(self.session.skills or [])
+            result.applied.append("已重载技能（%d → %d 份）" % (before, after))
+            for diag in diags or []:
+                result.diagnostics.append(
+                    diag.to_dict() if hasattr(diag, "to_dict") else diag)
+                self._absorb([diag])
+            # 写下来的经验要有出处，否则事后没人知道这条是谁教的。
+            self.session.app.append_decision(
+                "写入 app 级技能", os.path.basename(path), self.origin)
 
     def _guard_write_path(self, path: str) -> None:
-        allowed = path == "capabilities.py" or path == "DESIGN.md" or path.startswith("assets/")
+        # **app 级技能**（`.puppethub/skills/*.md`）是"状态升格为知识"：
+        # 它不改真源（程序仍只由命令批改），但会改变这个 app **以后**的决策。
+        # 因此它与 capabilities.py 同级可写，**且每次写都自动快照**（`_apply_write` 已做）——
+        # 知识能回滚，进化才不会不可逆。
+        skill = self._skill_path(path)
+        allowed = (path == "capabilities.py" or path == "DESIGN.md"
+                   or path.startswith("assets/") or skill)
         if not allowed:
-            raise BlockError("只允许写 capabilities.py / DESIGN.md / assets/**；"
-                             "程序本身请用命令批")
+            raise BlockError("只允许写 capabilities.py / DESIGN.md / assets/** / "
+                             ".puppethub/skills/*.md；程序本身请用命令批")
         if "../" in path or path.startswith("/") or ":" in path:
             raise BlockError("路径必须是 app 目录内的相对路径")
+        if skill and not path.endswith(".md"):
+            raise BlockError("技能必须是 .md 文件（front-matter + 正文）")
         if path.startswith("assets/"):
             name = path[len("assets/"):]
             exists = (self.session.app.assets_dir / name).is_file()
             if exists and name not in self._asset_manifest:
                 raise BlockError("这是**人放的资源**，LLM 不得覆盖它（改了文件名再写，"
                                  "或让人先删掉）")
+
+    @staticmethod
+    def _skill_path(path: str) -> bool:
+        """是否落在 app 级技能目录内（`skills.py` 只扫这一层，别的位置写了也读不到）。"""
+        if not path.startswith(".puppethub/skills/"):
+            return False
+        rest = path[len(".puppethub/skills/"):]
+        return bool(rest) and "/" not in rest and not rest.startswith(".")
 
     def _remember_asset(self, path: str) -> None:
         name = path[len("assets/"):]

@@ -28,6 +28,8 @@ from .compat import check_data_files, check_spec_version
 from .memory import Memory
 from .plugins import HostStorage, PluginError, build_registry, plugin_dirs, select_slots
 from .render import RENDERING
+from . import plan as _plan
+from . import watch as _watch
 
 ORIGINS = ("llm", "autonomous", "driver", "system", "user")
 
@@ -85,6 +87,14 @@ class Session:
         self.app.ensure_layout()
         self.engine = Engine(workdir=str(app.state_dir), rendering=RENDERING)
         self.renderer = None                       # 由宿主挂上（窗口 / 控制面）
+        # 窗口自己事件循环的句柄（宿主持有时挂上）。截图要 `await page.take_screenshot()`，
+        # 必须在**这个**循环里跑；后台线程调用时经它排回。无窗口实例（控制面 / 无头）为 None。
+        self._ui_loop = None
+        # 批末回灌信号：(本轮命令批, 受影响行号) 或 None。`send()` 里真源有变化才置位，
+        # 由 chat 取走（取即清零）——决定这一轮要不要请 LLM 看一眼界面。
+        self._visual_dirty: Optional[tuple] = None
+        self._visual_pending_lines: Optional[tuple] = None   # 最近一次批末的行（组视觉消息用）
+        self._visual_request = False                          # 人请它看（下次对话消费）
         self.on_change = on_change                 # 程序或状态变化后的宿主回调
         self.on_delta = None                       # 流式回调（窗口用它逐字上屏）
         self._lock = threading.RLock()
@@ -99,7 +109,15 @@ class Session:
         self.memory: Memory | None = None
         self.chat: Chat | None = None
         self.autonomous = None                      # AutonomousRunner（装配后才有）
+        self.watcher = None                         # Watcher（watch 看门狗，装配后才有）
+        self._last_attrs: dict = {}                 # 最近一帧快照的 attrs（plan 求值用）
         self.writer = "none"                        # 写者状态机（装配后置为 llm）
+        # **感知基线**（`discuss-sensing.md` §5.2）：`observe()` 每帧都返回全量状态，
+        # 而 `_absorb` 过去只消费诊断/事件/探针——`data`/`slots`/`flags` 被丢掉了。
+        # 这里留上一帧做 diff，"状态变了"就是 L2 要的感知信号。
+        # **基线始终更新**（哪怕自主没当值）：否则切换写者时第一帧会 diff 出
+        # 一大堆"假变化"，把 agent 叫醒做无用功。
+        self._percept_state: Optional[dict] = None
         self.fusion_target: str | None = None       # 融合对象路径（grilling 共识：只存路径，其余现算）
         self._cap_stamp = 0.0                       # capabilities.py 的 mtime（热重载检查点）
         self.plugin_error = ""
@@ -152,6 +170,19 @@ class Session:
             self._rebuild_catalog()
         self._absorb_diags(diags, "重载")
         self._note("SESSION", "信息", "已重载（瞬时状态丢弃，持久数据保留）")
+        return diags
+
+    def reload_skills(self) -> list:
+        """重载技能（app 把自己学到的东西写进 `.puppethub/skills/` 之后调用）。
+
+        **必须显式重载**：写完不重载，LLM 会以为经验生效了，下轮照样犯同样的错——
+        那是"静默失败"的一种伪装（它把自己的失败当成没发生过）。
+        重载后已取全文的技能**保留在会话里**（取过一次持续有效，见 chat._context）。
+        """
+        from . import skills as _skills
+        self.skills, diags = _skills.load(str(self.app.root), log=self._plugin_log)
+        for diag in diags:
+            self.note(diag.level, diag.code, diag.message)
         return diags
 
     # ------------------------------------------------------------ 插件与对话
@@ -231,6 +262,15 @@ class Session:
                 style=slots.get("style"))
         self.writer = "llm" if self.chat is not None else "none"
         self._cap_stamp = self._cap_mtime()
+        # **watch 看门狗（cron/阈值交给 LLM 自设）**：复用自主回路的 step 通道。
+        # 只在自主回路可用时才武装（watch 触发的是自主步进）；没有 LLM 则只落盘不触发。
+        if getattr(self, "watcher", None) is not None:
+            self.watcher.stop()
+        self.watcher = None
+        if self.autonomous is not None:
+            from .watch import Watcher
+            self.watcher = Watcher(self)
+            self.watcher.load()
 
     def _plugin_log(self, name: str, level: str, message: str) -> None:
         self.note(level, "PLUGIN:" + name, message)
@@ -290,6 +330,120 @@ class Session:
                                  reason or ("origin=%s" % origin), "运行期")
         self._changed()
         return True
+
+    def handoff_to_autonomous(self, origin: str = "user", reason: str = "") -> dict:
+        """**交棒**：把写者交给自主回路，交接前打一个命名快照当可回退的锚。
+
+        为什么需要它——"偏离设计算进化"这条判断是好的，它解开了"app 不敢改自己"的
+        死结；但它同时意味着**没有人再替 app 守方向**。所以进化必须有一个**硬的回退点**，
+        而不能靠"意图文档"（`DESIGN.md` 也在写白名单里，会被一起改掉）。
+        **快照不会自己变**——这是唯一可靠的锚。
+
+        交棒**不削弱任何边界**：切过去就是自主态，三道闸（整体替换拒绝 / 危险能力默认拒绝 /
+        连续失败熔断）自动生效。人随时可以 `set_writer("llm")` 拿回。
+        """
+        if self.autonomous is None:
+            self.note("error", "LLM_HANDOFF",
+                      "交棒失败：没有装配 LLM provider，自主回路不可用")
+            return {"ok": False, "reason": "自主回路不可用（没有装配 LLM provider）"}
+        if self.writer == "autonomous":
+            # 幂等：已经在自主态就如实说，不重复打快照（免得锚点被一次次覆盖）。
+            return {"ok": True, "already": True,
+                    "reason": "写者已经是 autonomous（无需重复交棒）"}
+        # **先打锚，再交棒**：顺序反了就来不及——交棒后的第一次改动可能立刻发生。
+        snap = None
+        try:
+            snap = self.app.push_snapshot("named", "交棒时的状态（app 自主进化前的锚）", origin)
+        except Exception as ex:  # noqa: BLE001 - 打锚失败必须可见，且**不静默放行**
+            self.note("error", "LLM_HANDOFF",
+                      "交棒中止：无法打命名快照（%s）。没有锚就不交棒——"
+                      "否则 app 一旦进化偏了，人没有可回退的点" % ex)
+            return {"ok": False, "reason": "无法打命名快照：%s" % ex}
+        ok = self.set_writer("autonomous", origin=origin,
+                             reason=reason or "人显式交棒（快照 %s 为回退锚）" % snap.id)
+        if not ok:
+            return {"ok": False, "reason": "写者切换被拒（自主回路不可用）"}
+        self.note("info", "LLM_HANDOFF",
+                  "已交棒：写者是 autonomous，从现在起**没有人兜底**。"
+                  "回退锚 = 快照 %s（随时可一键回滚）" % snap.id)
+        return {"ok": True, "snapshot": snap.id, "reason": "已交棒给自主回路"}
+
+    def set_plan(self, text: str, origin: str = "llm") -> tuple:
+        """处理 ```plan 块：解析、校验、落 `.puppethub/plan.json`。
+
+        照 `goal` / `watch` 的路（谁当值谁定、readonly 已挡非当值者），返回
+        `(ok, diag)`。`drop` 行**删掉做不了的步骤并记流水**——不做"静默消失"。
+
+        **plan 不增预算**：它只决定"做什么"，"能做多少"仍归 `steps_per_hour`。
+        """
+        plan, diag = _plan.parse_block(text)
+        if diag is not None:
+            self._note(diag["code"], _level_name(diag["level"]), diag["message"])
+            return False, diag
+        dropped = plan.get("drop") or []
+        steps = plan.get("steps") or []
+        dropped_text = [d.get("what", "") for d in dropped if isinstance(d, dict)]
+        if not steps and dropped:
+            # 只剩 drop = 旧计划被清空。要如实说，别让它以为"计划还在"。
+            self._clear_plan_state("plan 只剩 drop：步骤被全部撤销")
+            for what in dropped_text:
+                self.app.append_decision("撤销计划步骤", what[:120], origin)
+            return True, {"dropped": dropped_text, "steps": 0}
+        payload = {
+            "id": _plan.plan_id(plan.get("goal", "")),
+            "goal": plan.get("goal", ""),
+            "steps": steps,
+            "origin": origin,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            self.storage.write_json(".puppethub/plan.json", payload)
+        except Exception as ex:  # noqa: BLE001 - 已标脏，可见即可
+            d = {"code": "PLAN_WRITE", "level": "error",
+                 "message": "plan 写入失败：%s" % ex}
+            self._note(d["code"], "错误", d["message"])
+            return False, d
+        for what in dropped_text:
+            self.app.append_decision("撤销计划步骤", what[:120], origin)
+        self.app.append_decision("设定计划",
+                                 "%s（%d 步）" % (plan.get("goal", "") or "（无目标）", len(steps)),
+                                 origin)
+        judged = sum(1 for s in steps if s.get("done"))
+        self._note("PLAN", "信息",
+                   "计划已设定：%d 步（其中 %d 步带可核验判据）%s"
+                   % (len(steps), judged,
+                      ("；已撤销 %d 步" % len(dropped_text)) if dropped_text else ""))
+        self._changed()
+        return True, {"goal": plan.get("goal", ""), "steps": len(steps),
+                      "dropped": dropped_text, "judged": judged}
+
+    def _clear_plan_state(self, why: str) -> None:
+        try:
+            self.storage.write_json(".puppethub/plan.json", None)
+        except Exception as ex:  # noqa: BLE001
+            self._note("PLAN", "错误", "清除计划失败：%s" % ex)
+            return
+        self.app.append_decision("清除计划", why, "system")
+        self._note("PLAN", "信息", why)
+
+    def current_plan(self) -> dict:
+        """读当前计划。读不出来当没有——但**不假装**，由调用方注入上下文。"""
+        try:
+            data = self.storage.read_json(".puppethub/plan.json", None) or {}
+        except Exception:  # noqa: BLE001
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def plan_block(self) -> str:
+        """给 LLM 的「当前计划」块：用**机制求值**算出每步到没到，而不是问它自己。"""
+        plan = self.current_plan()
+        if not plan or not (plan.get("steps") or []):
+            return ""
+        attrs = self._last_attrs or {}
+        done, lines, warns = _plan.evaluate(plan["steps"], attrs)
+        for warn in warns:
+            self._note("PLAN_EVAL", "警告", warn)
+        return _plan.plan_block(plan, lines, done)
 
     def autonomous_step(self, trigger: str):
         """自主回路跑一步（事件触发或人手动点）。写者不是它时 runner 自己会拒绝。"""
@@ -728,6 +882,72 @@ class Session:
         self._changed()
         return True
 
+    def set_watch(self, text: str, origin: str = "llm") -> tuple:
+        """处理 ```watch 块：解析、校验边界、落 `.puppethub/watches.json`。
+
+        照 goal 的路（谁当值谁定、readonly 分支已挡非当值者），且**边界全部可见**：
+        语法错 `WATCH_INVALID`、超限 `WATCH_REJECTED`——绝不静默丢弃（第一原则）。
+        返回 `(ok, diag)`；diag 是 `{code, level, message}`，供调用方回灌给 LLM。
+        """
+        fields, diag = _watch.parse_block(text)
+        if diag is not None:
+            self._note(diag["code"], _level_name(diag["level"]), diag["message"])
+            return False, diag
+        # 边界：总数 / 最小间隔
+        existing = []
+        try:
+            existing = self.storage.read_json(".puppethub/watches.json", []) or []
+        except Exception:           # noqa: BLE001 - 读不出当空，写入路径负责可见性
+            existing = []
+        existing = [w for w in existing if isinstance(w, dict)]
+        wid = _watch.watch_id(fields["every_raw"], fields["when"], fields["why"])
+        is_update = any(w.get("id") == wid for w in existing)
+        if not is_update and len(existing) >= _watch.MAX_WATCHES:
+            d = {"code": "WATCH_REJECTED", "level": "error",
+                 "message": "watch 已达上限（%d 个），第 %d 个被拒——先合并或移除旧的"
+                            % (_watch.MAX_WATCHES, len(existing) + 1)}
+            self._note(d["code"], "错误", d["message"])
+            return False, d
+        if (fields["every_sec"] is not None
+                and fields["every_sec"] < _watch.MIN_INTERVAL):
+            d = {"code": "WATCH_REJECTED", "level": "error",
+                 "message": "watch 间隔 %ds 小于最小间隔 %ds，被拒（太密会烧光步进预算）"
+                            % (fields["every_sec"], _watch.MIN_INTERVAL)}
+            self._note(d["code"], "错误", d["message"])
+            return False, d
+        entry = {
+            "id": wid,
+            "every": fields["every_raw"],
+            "every_sec": fields["every_sec"],
+            "when": fields["when"],
+            "why": fields["why"],
+            "origin": origin,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        new_list = [w for w in existing if w.get("id") != wid] + [entry]
+        try:
+            self.storage.write_json(".puppethub/watches.json", new_list)
+        except Exception as ex:       # noqa: BLE001 - 已标脏，可见即可
+            d = {"code": "WATCH_WRITE", "level": "error",
+                 "message": "watch 写入失败：%s" % ex}
+            self._note(d["code"], "错误", d["message"])
+            return False, d
+        self.app.append_decision("设定 watch",
+                                 "%s%s（%s）"
+                                 % (("every=%s " % fields["every_raw"]) if fields["every_raw"] else "",
+                                    ("when=%s " % fields["when"]) if fields["when"] else "",
+                                    fields["why"] or "（无 why）"),
+                                 origin)
+        self._note("WATCH", "信息",
+                   "watch 已设定：%s%s%s"
+                   % (("every=%s " % fields["every_raw"]) if fields["every_raw"] else "",
+                      ("when=%s " % fields["when"]) if fields["when"] else "",
+                      ("——%s" % fields["why"]) if fields["why"] else ""))
+        if self.watcher is not None:
+            self.watcher.load()
+        self._changed()
+        return True, None
+
     def current_goal(self) -> str:
         try:
             data = self.storage.read_json(".puppethub/goal.json", None) or {}
@@ -736,6 +956,82 @@ class Session:
         return str(data.get("text") or "")
 
     # ------------------------------------------------------------ 写入
+
+    # ------------------------------------------------------------ 视觉感知
+
+    def take_visual_change(self) -> Optional[tuple]:
+        """取走批末回灌信号（取即清零）。返回 `(命令批行, 受影响行号)` 或 None。
+
+        **一次性**：取走后信号消失，同一改动不会被回灌第二次。
+        """
+        pending = self._visual_dirty
+        self._visual_dirty = None
+        if pending is not None:
+            self._visual_pending_lines = pending
+        return pending
+
+    def request_visual(self) -> None:
+        """人主动要求共作者看一眼界面（驾驶舱「让 LLM 看看」按钮 / REPL）。
+
+        只置位，不立刻截图——图要在**下一轮对话**里才发得出去（那样它才带着
+        "这是我刚做的"语境）。置位是可见的：观察流里留一条。
+        """
+        self._visual_request = True
+        self._note("SNAPSHOT", "信息", "已请求共作者下一轮看一眼界面")
+
+    def take_visual_request(self) -> bool:
+        """取走"人请它看"信号（取即清零）。"""
+        pending = self._visual_request
+        self._visual_request = False
+        return pending
+
+    def capture_for_llm(self, expect_change: bool = False) -> Optional[bytes]:
+        """要一张界面截图，供共作者"看见"自己画出的东西。
+
+        截图是 **async**（要 `await page.take_screenshot()`，且必须在窗口自己的事件
+        循环里跑），而本方法是**同步**的（调用方在后台线程 / CLI 线程）。
+        桥接沿用项目已验证的模式：`page.run_task()` 把协程排回事件循环，
+        这里用 `concurrent.futures` 等它完成——**不是**新造一套机制。
+
+        返回 None 的三种情形**都会留下可见诊断**（调用方按需再报，此处只产原因）：
+          · 没有渲染器（控制面 / 无头绑定）——"看不见"是事实，不是故障
+          · 渲染器不支持截图（未声明 snapshot）
+          · 重试尽空 / `expect_change` 校验未通过（界面该变却没变）
+        """
+        if self.renderer is None:
+            return None
+        if not RENDERING.get("snapshot"):
+            return None
+        loop = self._ui_loop
+        page = getattr(self.renderer, "page", None)
+        if loop is None or page is None:
+            return None
+        import concurrent.futures
+
+        holder: "concurrent.futures.Future" = concurrent.futures.Future()
+
+        async def _grab() -> None:
+            try:
+                image = await self.renderer.capture(expect_change=expect_change)
+                if not holder.done():
+                    holder.set_result(image)
+            except Exception as ex:  # noqa: BLE001 - 截图失败必须可见
+                if not holder.done():
+                    holder.set_exception(ex)
+
+        try:
+            page.run_task(_grab)
+        except Exception as ex:  # noqa: BLE001 - 排不进事件循环（如跨线程 run_task 不可用）
+            self._note("SNAPSHOT", "警告", "截图排不进事件循环：%s" % ex)
+            return None
+        try:
+            return holder.result(timeout=8)
+        except concurrent.futures.TimeoutError:
+            self._note("SNAPSHOT", "警告", "截图超时（8s 未返回），本轮不发图")
+            return None
+        except Exception as ex:  # noqa: BLE001
+            self._note("SNAPSHOT", "警告", "截图失败：%s" % ex)
+            return None
 
     def send(self, lines: list, origin: str = "llm") -> list:
         """应用一个命令批，并在批末一次性写回真源。
@@ -769,6 +1065,11 @@ class Session:
                        "%s 改写真源：%d 行（批末整份重排，已自动存档）" % (origin, len(after)))
         else:
             self._note("WRITEBACK", "信息", "%s 的命令批未改变真源文本" % origin)
+        # **批末回灌的触发标记**：真源确有变化才置位（没变就没有"新界面"可看）。
+        # 消费方是 chat：它据此决定这一轮要不要请 LLM 看一眼自己的作品。
+        # 消费即清零——**一次性信号**，防止同一改动被反复回灌。
+        if changed and len(lines) > 0:
+            self._visual_dirty = (list(lines), [d.line for d in diags if getattr(d, "line", None)])
         self._changed()
         return diags
 
@@ -787,8 +1088,88 @@ class Session:
         """交互事件：用户动作 → 引擎。渲染器不自己实现业务反应。"""
         diags = self.engine.fire(target, event, row, value)
         self._absorb_diags(diags, "交互 %s #%s" % (event, target))
+        self._perceive_interaction(target, event)
         self._changed()
         return diags
+
+    # ------------------------------------------------------------ 感知（L2）
+
+    def _perceive_interaction(self, target: str, event: str) -> None:
+        """**盲区判据**：交互无处可去 → 唤醒自主回路。
+
+        判据是"既没有处理器、也没有人订阅"——那种点击在程序里**没有任何去处**，
+        界面上什么也不会发生，正是 agent 该补一手的地方（加规则 / 改界面 / 反问）。
+        反过来，只要有规则接，IR 就会响应，**不该**去唤醒 LLM（那是白烧预算）。
+
+        注意 `program.handlers` / `listens` 的 target **不带 `#`**（实测）。
+        **写者检查放在这一层**（而不是 runner 里）：非自主当值时连 diff 都不用跑。
+        """
+        if self.autonomous is None or self.writer != "autonomous":
+            return
+        key = (str(target or "").lstrip("#"), str(event or ""))
+        if not key[0] or not key[1]:
+            return
+        program = getattr(self.engine, "program", None)
+        if program is None:
+            return
+        if key in {(h.target, h.event) for h in program.handlers}:
+            return
+        if key in {(l.target, l.event) for l in program.listens}:
+            return
+        self.autonomous.on_interaction(key[0], key[1])
+
+    @staticmethod
+    def _fingerprint(snap: dict) -> dict:
+        """从观察快照里取出**值得 diff 的三样**（`attrs`/`rows` 量太大，不进感知）。"""
+        return {
+            "data": snap.get("data") or {},
+            "slots": snap.get("slots") or {},
+            "flags": snap.get("flags") or {},
+        }
+
+    @staticmethod
+    def _diff_state(prev: dict, cur: dict) -> list:
+        """相邻两帧的差异：`[(类别, 地址, 之前, 之后), …]`。"""
+        changes: list = []
+        for kind in ("data", "slots", "flags"):
+            before_map = prev.get(kind) or {}
+            after_map = cur.get(kind) or {}
+            for addr in sorted(set(before_map) | set(after_map)):
+                before, after = before_map.get(addr), after_map.get(addr)
+                if before != after:
+                    changes.append((kind, addr, before, after))
+        return changes
+
+    def _perceive_state(self, snap: dict) -> None:
+        """**状态变化感知**：拿上一帧的基线 diff 出"变了什么"。
+
+        已知取舍：这是**终态** diff，中间态会漏（`5→3→7` 只看到 `5→7`）。
+        对"值是否越界"这类判据无影响；真要"过程"得靠引擎侧事件钩子。
+
+        **基线每帧都更新**（哪怕自主没当值）：否则切换写者时第一帧会 diff 出一大堆
+        "假变化"，把 agent 叫醒做无用功。
+        """
+        current = self._fingerprint(snap)
+        prev, self._percept_state = self._percept_state, current
+        if prev is None or self.autonomous is None or self.writer != "autonomous":
+            return                      # 第一帧只建基线；非自主当值只更新基线
+        changes = self._diff_state(prev, current)
+        if changes:
+            self.autonomous.on_state_change(changes)
+
+    def _perceive_watches(self, snap: dict) -> None:
+        """watch 看门狗（cron/阈值）：when-only 在每帧求值（上升沿触发）。
+
+        `every` 定时器自带线程、自行到点，不在这里触发——这里只把最新快照喂给它，
+        免得它再去 observe 抢走诊断。
+        """
+        self.watcher.note_snapshot(snap)
+        self.watcher.evaluate_conditions(snap.get("attrs") or {})
+
+    def _note_attrs(self, snap: dict) -> None:
+        """**复用本帧快照**给 plan 求值用——不新增 `observe()` 消费者（读即消费，
+        第二个消费者会抢走诊断）。attrs 只在本帧存一份给 plan 用。"""
+        self._last_attrs = snap.get("attrs") or {}
 
     # ------------------------------------------------------------ 观察
 
@@ -817,6 +1198,13 @@ class Session:
         for probe in snap.get("probes", []):
             self._note("PROBE", "探针", "%s %s → %s" % (probe.get("verb"), probe.get("target"),
                                                        _short(probe.get("result"))))
+        # 感知（L2）：状态变化从这里来——快照已经在手，只是过去没被用。
+        self._perceive_state(snap)
+        # watch 看门狗（cron/阈值）：when-only 在每帧求值（边沿触发）；every 定时器自带线程。
+        if self.watcher is not None:
+            self._perceive_watches(snap)
+        # plan 完成判据也吃这一份快照（**不另起 observe**）。
+        self._note_attrs(snap)
 
     def _absorb_diags(self, diags, stage: str) -> None:
         for diag in diags or []:
